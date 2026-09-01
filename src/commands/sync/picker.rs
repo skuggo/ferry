@@ -697,6 +697,7 @@ mod source_tests {
         crate::ftp::Entry {
             name: name.to_string(),
             is_dir: kind == EntryKind::Directory,
+            is_symlink: false,
             size: 0,
             modified: chrono::Utc::now(),
         }

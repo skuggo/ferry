@@ -7,7 +7,7 @@ impl zed::Extension for FerryExtension {
         Self
     }
 
-    // Zed calls this once per worktree the first time a C file is opened.
+    // Zed calls this once per worktree the first time a C or C++ file is opened.
     // We just return the command to launch `ferry-lsp`; the LSP process
     // then handles textDocument/didOpen for every subsequent open in that
     // worktree.

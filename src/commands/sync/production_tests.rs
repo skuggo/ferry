@@ -164,6 +164,7 @@ impl ProductionRemote {
         Entry {
             name: name.to_string(),
             is_dir,
+            is_symlink: false,
             size,
             modified,
         }

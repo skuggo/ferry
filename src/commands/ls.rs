@@ -5,7 +5,7 @@
 //! configured `remote_root`.
 
 use crate::config::Config;
-use crate::ftp::Ftp;
+use crate::ftp::{Entry, Ftp};
 use anyhow::Result;
 use std::path::Path;
 
@@ -35,7 +35,7 @@ pub fn run(config_path: &Path, sub: Option<&str>) -> Result<()> {
 
     let entries = ftp.list(&dir)?;
     for e in entries {
-        let kind = if e.is_dir { 'd' } else { '-' };
+        let kind = kind_char(&e);
         println!(
             "{kind} {size:>10} {mtime}  {name}",
             kind = kind,
@@ -45,4 +45,46 @@ pub fn run(config_path: &Path, sub: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The leading type character, mirroring `ls -l`. Symlinks get their own
+/// marker: `ls` is the one command that still shows them, because every
+/// syncing command skips them and every write path refuses them, and a user
+/// staring at a "missing" file needs to be able to see why.
+fn kind_char(entry: &Entry) -> char {
+    if entry.is_symlink {
+        'l'
+    } else if entry.is_dir {
+        'd'
+    } else {
+        '-'
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kind_char;
+    use crate::ftp::Entry;
+    use chrono::Utc;
+
+    fn entry(is_dir: bool, is_symlink: bool) -> Entry {
+        Entry {
+            name: "x".into(),
+            is_dir,
+            is_symlink,
+            size: 0,
+            modified: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_symlink_is_marked_even_though_it_is_not_a_directory() {
+        assert_eq!(kind_char(&entry(false, true)), 'l');
+    }
+
+    #[test]
+    fn directories_and_files_keep_their_markers() {
+        assert_eq!(kind_char(&entry(true, false)), 'd');
+        assert_eq!(kind_char(&entry(false, false)), '-');
+    }
 }

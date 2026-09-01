@@ -443,6 +443,14 @@ fn resolve_remote_destination<R: StrictDestinationRead + ?Sized>(
             }
             anyhow::bail!("remote destination parent is missing below {directory:?}");
         };
+        // A symlink is neither a safe destination nor a safe path to descend:
+        // the server resolves the target, which can sit outside the configured
+        // remote root. Refuse before the leaf/parent split so both are covered.
+        if entry.is_symlink {
+            anyhow::bail!(
+                "remote destination is a symlink at {expected:?} in {directory:?}: refusing to follow it because the target can resolve outside the configured remote root"
+            );
+        }
         if is_leaf {
             return Ok(if entry.is_dir {
                 StrictRemoteResolution::Directory
@@ -640,6 +648,7 @@ mod tests {
         Entry {
             name: name.to_string(),
             is_dir,
+            is_symlink: false,
             size: bytes.len() as u64,
             modified,
         }
@@ -649,9 +658,64 @@ mod tests {
         Entry {
             name: name.to_string(),
             is_dir: false,
+            is_symlink: false,
             size,
             modified: Utc::now(),
         }
+    }
+
+    fn symlink_entry(name: &str) -> Entry {
+        Entry {
+            name: name.to_string(),
+            is_dir: false,
+            is_symlink: true,
+            size: 8,
+            modified: Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_symlink_leaf_destination_is_refused_rather_than_reported_missing() {
+        let mut remote = ScriptedDestinationRead::default();
+        remote
+            .listings
+            .insert("/root".into(), vec![symlink_entry("secrets.c")]);
+
+        let error =
+            snapshot_remote_destination(&mut remote, "/root", "/root/secrets.c").unwrap_err();
+
+        // Reporting `Missing` here is what let a guarded upload STOR straight
+        // through the link and out of the configured remote root.
+        assert!(format!("{error:#}").contains("remote destination is a symlink"));
+    }
+
+    #[test]
+    fn a_symlink_parent_segment_is_refused_before_descending_into_it() {
+        let mut remote = ScriptedDestinationRead::default();
+        remote
+            .listings
+            .insert("/root".into(), vec![symlink_entry("nested")]);
+
+        let error =
+            snapshot_remote_destination(&mut remote, "/root", "/root/nested/page.txt").unwrap_err();
+
+        assert!(format!("{error:#}").contains("symlink"));
+        // The traversal must stop at the link, never list through it.
+        assert_eq!(remote.events, ["list /root"]);
+    }
+
+    #[test]
+    fn a_symlink_refusal_message_carries_no_control_characters() {
+        let mut remote = ScriptedDestinationRead::default();
+        remote
+            .listings
+            .insert("/root".into(), vec![symlink_entry("secrets.c")]);
+
+        let error =
+            snapshot_remote_destination(&mut remote, "/root", "/root/secrets.c").unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(!message.chars().any(char::is_control));
     }
 
     #[test]

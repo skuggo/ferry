@@ -213,7 +213,7 @@ Behaviour:
 ## Native Zed integration
 
 The companion extension at [`extensions/ferry/`](extensions/ferry/README.md)
-starts `ferry-lsp` for Zed's C language. The language server handles file-open
+starts `ferry-lsp` for Zed's C and C++ languages. The language server handles file-open
 and file-save events directly and offers manual file actions. Follow
 [Installation](#installation) to install both binaries and the development
 extension in Zed.
@@ -278,9 +278,10 @@ described above are terminal-backed alternatives when you want command
 output, project Status/Sync, a recursive current-folder sync, or a single
 interactive path selection.
 
-The extension attaches only to Zed's C language by default. `.h` files are
-covered when Zed classifies them as C; see the extension README if your header
-is attached to a different language.
+The extension attaches to Zed's C and C++ languages by default. `.h` files are
+covered either way — Zed classifies them as C by default, and setups that route
+a header to C++ (LPC projects commonly do) are covered by the C++ entry; see the
+extension README if your file is attached to some other language.
 
 ## Remote compile checks (`cc`)
 

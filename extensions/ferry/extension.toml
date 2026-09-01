@@ -1,14 +1,16 @@
 id = "ferry"
 name = "Ferry"
-version = "0.2.0"
+version = "0.3.0"
 schema_version = 1
 authors = ["Simon Lundmark <simon@dagg.ai>"]
 description = "Configurable Ferry project sync with manual file and folder actions, native diff, and opt-in pull-on-open and push-on-save."
 repository = "https://github.com/simon/zed_ftp"
 
-# Attach the LSP to Zed's built-in C language. C headers (.h) are covered
-# because Zed maps .h to the C language by default. If you also want C++
-# coverage, add "C++" to the languages list here.
+# Attach the LSP to Zed's built-in C and C++ languages. Headers (.h) are
+# covered either way: Zed maps .h to C by default, and setups that classify a
+# header as C++ (LPC projects commonly do) are covered by the C++ entry. To
+# reach a language that is not listed here, add its Zed language name to this
+# list.
 [language_servers.ferry-lsp]
 name = "Ferry LSP"
 languages = ["C", "C++"]

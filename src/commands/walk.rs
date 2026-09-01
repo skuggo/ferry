@@ -92,17 +92,33 @@ pub fn walk_remote<R: Remote + ?Sized>(
     sub: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<()> {
-    // Preserve "/" as the FTP root. Trimming it to an empty string makes
-    // LIST use the server's current directory, which can silently point at a
-    // different subtree and corrupt every recursive remote path.
-    let root_dir = if root.trim_end_matches('/').is_empty() {
-        "/".to_string()
-    } else {
-        root.trim_end_matches('/').to_string()
-    };
+    let mut symlinks = BTreeSet::new();
+    walk_remote_with_symlinks(ftp, root, sub, out, &mut symlinks)
+}
+
+/// As [`walk_remote`], but also reports the relative path of every entry the
+/// walk skipped because the server described it as a symlink.
+///
+/// Callers that write must consult this. A skipped symlink is absent from
+/// `out`, and "absent" otherwise classifies as `LocalOnly` — which uploads,
+/// and the server resolves the link, putting the write outside the configured
+/// remote root. Read-only callers can use [`walk_remote`] and drop the set.
+pub fn walk_remote_with_symlinks<R: Remote + ?Sized>(
+    ftp: &mut R,
+    root: &str,
+    sub: &str,
+    out: &mut BTreeSet<String>,
+    symlinks: &mut BTreeSet<String>,
+) -> Result<()> {
+    let root_dir = listable_remote_root(root);
     let dir = if sub.is_empty() {
         root_dir
     } else {
+        // `root_dir` is "/" or already trimmed, so this trim only ever turns
+        // "/" back into "" -- which is exactly what keeps "/" + "a/b" from
+        // becoming "//a/b". A doubled slash survives LIST on some servers but
+        // then fails `child_name`'s absolute-echo prefix check, silently
+        // dropping every child of the walk.
         format!("{}/{}", root_dir.trim_end_matches('/'), sub)
     };
     // `sub` may name a single file rather than a directory — `pull`/`push`/`rm`
@@ -112,10 +128,80 @@ pub fn walk_remote<R: Remote + ?Sized>(
     // the argument back as the filename, vsftpd replies with the bare basename
     // (indistinguishable from a real child), and others refuse outright.
     if !sub.is_empty() && ftp.file_size(&dir).is_ok() {
+        // SIZE succeeds on a symlink to a file, so it cannot tell a real file
+        // from a link. One listing of the parent settles it. This costs a round
+        // trip only for an explicit path argument, never per file in a walk.
+        match leaf_is_symlink(ftp, root, &dir) {
+            Some(true) => {
+                warn_skipping_symlink(sub);
+                symlinks.insert(sub.to_string());
+                return Ok(());
+            }
+            Some(false) => {}
+            None => eprintln!(
+                "warning: cannot confirm whether remote {sub:?} is a symlink: \
+                 its parent directory would not list"
+            ),
+        }
         out.insert(sub.to_string());
         return Ok(());
     }
-    walk_remote_inner(ftp, root, sub, &dir, out, /* top_level = */ true)
+    walk_remote_inner(
+        ftp, root, sub, &dir, out, symlinks, /* top_level = */ true,
+    )
+}
+
+/// The directory to hand `LIST` for a configured `remote_root`.
+///
+/// Preserving "/" matters: trimming it to an empty string makes `LIST` use the
+/// server's current directory, which on a non-chrooted server is the login home
+/// rather than the root — so the top level came from one subtree while every
+/// child path was built as `/name` from another.
+///
+/// An empty `remote_root` normalizes to "/" for the same reason
+/// `remote_join("", rel)` already yields `/rel`. It is not rejected here
+/// because this is also the read path; `sync` and `init` reject it outright.
+///
+/// Note: `file_transfer::normalize_remote_root` and
+/// `sync::inventory::normalize_remote_root` are two further copies of this
+/// logic. Consolidating all three (ideally by normalizing once in
+/// `Config::load`, which already does this for `local_root`) is worth a
+/// follow-up, but is deliberately out of scope here.
+fn listable_remote_root(root: &str) -> String {
+    let trimmed = root.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn warn_skipping_symlink(relative: &str) {
+    eprintln!(
+        "warning: skipping remote symlink {relative:?}: not following it, the target can resolve outside the remote root"
+    );
+}
+
+/// Ask the server whether the leaf of `dir` is a symlink, using one listing of
+/// its parent directory.
+///
+/// `None` means the question could not be answered — the parent would not list,
+/// or it does not name the leaf at all. Callers keep their previous behaviour in
+/// that case rather than turning a listing hiccup into a refusal.
+pub fn leaf_is_symlink<R: Remote + ?Sized>(ftp: &mut R, root: &str, dir: &str) -> Option<bool> {
+    let trimmed = dir.trim_end_matches('/');
+    let (parent, leaf) = trimmed.rsplit_once('/')?;
+    if leaf.is_empty() {
+        return None;
+    }
+    let parent = if parent.is_empty() { "/" } else { parent };
+    let entries = ftp.list_dir(parent).ok()?;
+    for entry in entries {
+        if child_name(root, parent, &entry.name) == Some(leaf) {
+            return Some(entry.is_symlink);
+        }
+    }
+    None
 }
 
 /// Resolve one user-supplied path arg into `out`, covering both the directory
@@ -136,9 +222,25 @@ pub fn collect_remote_arg<R: Remote + ?Sized>(
     rel: &str,
     out: &mut BTreeSet<String>,
 ) -> usize {
+    let mut symlinks = BTreeSet::new();
+    collect_remote_arg_with_symlinks(ftp, root, rel, out, &mut symlinks)
+}
+
+/// As [`collect_remote_arg`], but reports skipped symlinks the way
+/// [`walk_remote_with_symlinks`] does, and never lets the `SIZE` fallback
+/// resurrect one as a transfer target.
+pub fn collect_remote_arg_with_symlinks<R: Remote + ?Sized>(
+    ftp: &mut R,
+    root: &str,
+    rel: &str,
+    out: &mut BTreeSet<String>,
+    symlinks: &mut BTreeSet<String>,
+) -> usize {
     let before = out.len();
-    let walked = walk_remote(ftp, root, rel, out);
-    if walked.is_err() || out.len() == before {
+    let walked = walk_remote_with_symlinks(ftp, root, rel, out, symlinks);
+    // `SIZE` cannot distinguish a file from a symlink to one, so a path the
+    // walk already identified as a link must not come back through here.
+    if (walked.is_err() || out.len() == before) && !symlinks.contains(rel) {
         let remote_path = remote_join(root, rel);
         if ftp.file_size(&remote_path).is_ok() {
             out.insert(rel.to_string());
@@ -185,12 +287,14 @@ fn child_name<'a>(root: &str, dir: &str, name: &'a str) -> Option<&'a str> {
     is_under(root, &format!("{dir}/{rest}")).then_some(rest)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_remote_inner<R: Remote + ?Sized>(
     ftp: &mut R,
     root: &str,
     sub: &str,
     dir: &str,
     out: &mut BTreeSet<String>,
+    symlinks: &mut BTreeSet<String>,
     top_level: bool,
 ) -> Result<()> {
     let entries = match ftp.list_dir(dir) {
@@ -205,6 +309,27 @@ fn walk_remote_inner<R: Remote + ?Sized>(
     };
     for entry in entries {
         if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        // A symlink is not syncable: FTP carries no link records, and the
+        // server resolves the target, which can sit outside the remote root.
+        // Record it so write paths refuse the path instead of reading its
+        // absence from `out` as "safe to create".
+        if entry.is_symlink {
+            if let Some(name) = child_name(root, dir, &entry.name) {
+                let child_sub = if sub.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}/{}", sub, name)
+                };
+                warn_skipping_symlink(&child_sub);
+                symlinks.insert(child_sub);
+            } else {
+                eprintln!(
+                    "warning: skipping remote symlink {:?} in {dir}: not a path under the sync root",
+                    entry.name
+                );
+            }
             continue;
         }
         // A server that answers `LIST <file>` by describing the file itself.
@@ -234,7 +359,7 @@ fn walk_remote_inner<R: Remote + ?Sized>(
         };
         if entry.is_dir {
             let child_dir = format!("{}/{}", dir.trim_end_matches('/'), name);
-            let _ = walk_remote_inner(ftp, root, &child_sub, &child_dir, out, false);
+            let _ = walk_remote_inner(ftp, root, &child_sub, &child_dir, out, symlinks, false);
         } else {
             out.insert(child_sub);
         }
@@ -270,6 +395,8 @@ mod walk_remote_tests {
         /// Extra entries injected into a directory's listing, used to exercise
         /// the containment check.
         inject: HashMap<String, Vec<(String, bool)>>,
+        /// Per-directory child names the server describes as POSIX symlinks.
+        symlinks: HashMap<String, Vec<String>>,
         pub listed: Vec<String>,
     }
 
@@ -277,6 +404,17 @@ mod walk_remote_tests {
         Entry {
             name: name.to_string(),
             is_dir,
+            is_symlink: false,
+            size: 1,
+            modified: Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap(),
+        }
+    }
+
+    fn symlink_entry(name: &str) -> Entry {
+        Entry {
+            name: name.to_string(),
+            is_dir: false,
+            is_symlink: true,
             size: 1,
             modified: Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap(),
         }
@@ -305,6 +443,7 @@ mod walk_remote_tests {
                 echo,
                 supports_size: true,
                 inject: HashMap::new(),
+                symlinks: HashMap::new(),
                 listed: Vec::new(),
             }
         }
@@ -317,6 +456,9 @@ mod walk_remote_tests {
                 let mut out: Vec<Entry> = children.iter().map(|(n, d)| entry(n, *d)).collect();
                 if let Some(extra) = self.inject.get(dir) {
                     out.extend(extra.iter().map(|(n, d)| entry(n, *d)));
+                }
+                if let Some(links) = self.symlinks.get(dir) {
+                    out.extend(links.iter().map(|n| symlink_entry(n)));
                 }
                 return Ok(out);
             }
@@ -367,21 +509,142 @@ mod walk_remote_tests {
         let mut f = Fake::new(Echo::AbsolutePath);
         f.dirs.clear();
         f.dirs.insert("/".into(), vec![("players".into(), true)]);
-        f.dirs.insert(
-            "/players".into(),
-            vec![("skuggis".into(), true)],
-        );
-        f.dirs.insert(
-            "/players/skuggis".into(),
-            vec![("castle.c".into(), false)],
-        );
+        f.dirs
+            .insert("/players".into(), vec![("skuggis".into(), true)]);
+        f.dirs
+            .insert("/players/skuggis".into(), vec![("castle.c".into(), false)]);
         f.files = vec!["/players/skuggis/castle.c".into()];
 
         let mut out = BTreeSet::new();
         walk_remote(&mut f, "/", "", &mut out).unwrap();
 
-        assert_eq!(out.into_iter().collect::<Vec<_>>(), vec!["players/skuggis/castle.c"]);
+        assert_eq!(
+            out.into_iter().collect::<Vec<_>>(),
+            vec!["players/skuggis/castle.c"]
+        );
         assert_eq!(f.listed.first().map(String::as_str), Some("/"));
+    }
+
+    #[test]
+    fn slash_root_joins_a_subpath_without_doubling_the_separator() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.dirs.clear();
+        f.dirs
+            .insert("/players/skuggis".into(), vec![("castle.c".into(), false)]);
+
+        let mut out = BTreeSet::new();
+        walk_remote(&mut f, "/", "players/skuggis", &mut out).unwrap();
+
+        // `//players/skuggis` would survive LIST on some servers but then fail
+        // `child_name`'s absolute-echo prefix check, silently dropping every
+        // child of every subpath walk under `remote_root = "/"`.
+        assert_eq!(f.listed, ["/players/skuggis"]);
+        assert_eq!(
+            out.into_iter().collect::<Vec<_>>(),
+            vec!["players/skuggis/castle.c"]
+        );
+    }
+
+    #[test]
+    fn leaf_is_symlink_answers_from_one_listing_of_the_parent() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.symlinks.insert("/root".into(), vec!["link.c".into()]);
+
+        assert_eq!(leaf_is_symlink(&mut f, "/root", "/root/link.c"), Some(true));
+        assert_eq!(leaf_is_symlink(&mut f, "/root", "/root/a.txt"), Some(false));
+        assert_eq!(f.listed, ["/root", "/root"]);
+    }
+
+    #[test]
+    fn leaf_is_symlink_is_unknown_when_the_parent_will_not_list() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+
+        // No answer is not the same as "safe": callers must keep their prior
+        // behaviour rather than read `None` as `Some(false)`.
+        assert_eq!(leaf_is_symlink(&mut f, "/root", "/gone/link.c"), None);
+    }
+
+    #[test]
+    fn leaf_is_symlink_is_unknown_when_the_parent_does_not_name_the_leaf() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+
+        assert_eq!(leaf_is_symlink(&mut f, "/root", "/root/absent.c"), None);
+    }
+
+    #[test]
+    fn walk_skips_a_remote_symlink_but_keeps_its_siblings() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.symlinks.insert("/root".into(), vec!["link.c".into()]);
+
+        let out = walk(&mut f, "").unwrap();
+
+        // The link is not syncable; the real files beside it still are.
+        assert!(!out.contains("link.c"));
+        assert!(out.contains("a.txt"));
+        assert!(out.contains("sub/b.txt"));
+    }
+
+    #[test]
+    fn walk_reports_the_relative_path_of_every_skipped_symlink() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.symlinks.insert("/root".into(), vec!["link.c".into()]);
+        f.symlinks.insert("/root/sub".into(), vec!["deep.c".into()]);
+
+        let mut out = BTreeSet::new();
+        let mut symlinks = BTreeSet::new();
+        walk_remote_with_symlinks(&mut f, "/root", "", &mut out, &mut symlinks).unwrap();
+
+        // Write paths need these to refuse the upload. Treating them as merely
+        // absent is what lets a STOR follow the link out of the remote root.
+        assert_eq!(
+            symlinks.into_iter().collect::<Vec<_>>(),
+            vec!["link.c", "sub/deep.c"]
+        );
+    }
+
+    #[test]
+    fn walk_does_not_descend_through_a_symlinked_directory() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.symlinks.insert("/root".into(), vec!["elsewhere".into()]);
+        f.dirs
+            .insert("/root/elsewhere".into(), vec![("escaped.c".into(), false)]);
+
+        let out = walk(&mut f, "").unwrap();
+
+        assert!(!out.iter().any(|path| path.starts_with("elsewhere")));
+        assert!(!f.listed.iter().any(|dir| dir == "/root/elsewhere"));
+    }
+
+    #[test]
+    fn a_single_symlink_path_arg_is_refused_rather_than_sized_into_a_target() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.symlinks.insert("/root".into(), vec!["link.c".into()]);
+        // SIZE succeeds on a symlink to a file, which is exactly how the
+        // single-path fast path used to smuggle one in as a normal target.
+        f.files.push("/root/link.c".into());
+
+        let mut out = BTreeSet::new();
+        let mut symlinks = BTreeSet::new();
+        walk_remote_with_symlinks(&mut f, "/root", "link.c", &mut out, &mut symlinks).unwrap();
+
+        assert!(out.is_empty());
+        assert_eq!(symlinks.into_iter().collect::<Vec<_>>(), vec!["link.c"]);
+    }
+
+    #[test]
+    fn collect_remote_arg_does_not_resurrect_a_symlink_through_the_size_fallback() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.symlinks.insert("/root".into(), vec!["link.c".into()]);
+        f.files.push("/root/link.c".into());
+
+        let mut out = BTreeSet::new();
+        let mut symlinks = BTreeSet::new();
+        let added =
+            collect_remote_arg_with_symlinks(&mut f, "/root", "link.c", &mut out, &mut symlinks);
+
+        assert_eq!(added, 0);
+        assert!(out.is_empty());
+        assert_eq!(symlinks.into_iter().collect::<Vec<_>>(), vec!["link.c"]);
     }
 
     #[test]
@@ -439,15 +702,17 @@ mod walk_remote_tests {
         }
     }
 
-    /// A file arg is resolved without listing it as a directory at all, so the
-    /// self-description case never arises in the first place.
+    /// A file arg is never listed *as a directory*, so the self-description
+    /// case never arises. Its parent is listed once, which is what tells a real
+    /// file apart from a symlink to one — `SIZE` succeeds for both.
     #[test]
-    fn file_arg_is_resolved_by_size_probe_without_listing() {
+    fn file_arg_is_resolved_by_size_probe_without_listing_the_file() {
         let mut f = Fake::new(Echo::AbsolutePath);
         let _ = walk(&mut f, "a.txt").unwrap();
+        assert_eq!(f.listed, ["/root"]);
         assert!(
-            f.listed.is_empty(),
-            "should not have listed anything, listed: {:?}",
+            !f.listed.iter().any(|dir| dir == "/root/a.txt"),
+            "should not have listed the file itself, listed: {:?}",
             f.listed
         );
     }

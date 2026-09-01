@@ -159,8 +159,22 @@ command returns conflict exit code `2`.
 
 ## Language attachment caveat
 
-The extension attaches to Zed's built-in C language only. Zed normally treats
-`.h` files as C, so they are usually covered. If a header is classified as C++
-or another language in your setup, Ferry will not attach to it unless you add
-that language under `[language_servers.ferry-lsp].languages` in
-`extension.toml`.
+The extension attaches to Zed's built-in C and C++ languages. Headers (`.h`)
+are covered either way: Zed maps `.h` to C by default, and setups that classify
+a header as C++ — LPC projects commonly do — are covered by the C++ entry. If a
+file is classified as some other language in your setup, Ferry will not attach
+to it unless you add that language under
+`[language_servers.ferry-lsp].languages` in `extension.toml`.
+
+## Remote symlinks
+
+Ferry never follows a remote symlink. The server resolves the link target, and
+that target can sit outside the configured `remote_root`, so a transfer through
+one would escape the sync boundary.
+
+Every enumerating command (`pull`, `push`, `status`, `sync`, the scoped-sync
+picker) skips symlink records and prints a warning naming the path. Every write
+path refuses them outright, and that refusal is **not** overridable with
+`--force`: the flag means "overwrite remote edits", never "write outside the
+remote root". `ferry ls` still shows them, marked `l`, so a path that is being
+skipped is visible rather than mysteriously absent.

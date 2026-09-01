@@ -469,9 +469,24 @@ pub(super) fn list_remote_children<R: StrictRemote + ?Sized>(
         if entry.name == "." || entry.name == ".." {
             continue;
         }
+        // Name validation and the duplicate guard run for every record type,
+        // symlinks included: an unsafe name or a self-contradictory listing is
+        // a server problem regardless of what the record claims to be, and
+        // skipping first would quietly exempt links from both checks.
         let name = remote_child_name(remote_root, directory, &entry)?;
         if !names.insert(name.clone()) {
             bail!("duplicate remote entry {name:?} in {directory:?}");
+        }
+        // Symlinks are not syncable and must not be descended into: the server
+        // resolves the target, which can sit outside the configured remote
+        // root. Skipping keeps one link from aborting the whole inventory --
+        // the write paths refuse these paths independently.
+        if entry.is_symlink {
+            eprintln!(
+                "warning: skipping remote symlink {:?} in {directory:?}: not following it, the target can resolve outside the remote root",
+                sanitize_entry_name(&name)
+            );
+            continue;
         }
         let relative = join_relative(relative_directory, &name);
         if is_state_path(&relative) || is_reserved_remote_transfer_temp(&relative) {
@@ -491,6 +506,13 @@ pub(super) fn list_remote_children<R: StrictRemote + ?Sized>(
 pub(super) struct RemoteChild {
     pub(super) name: String,
     pub(super) is_dir: bool,
+}
+
+/// Escape a server-supplied name for a warning. Unlike `remote_child_name`,
+/// which refuses control characters outright, a skipped symlink is only
+/// reported -- so the name still has to be rendered safely.
+fn sanitize_entry_name(name: &str) -> String {
+    name.chars().flat_map(char::escape_default).collect()
 }
 
 fn remote_child_name(remote_root: &str, directory: &str, entry: &Entry) -> Result<String> {
@@ -623,7 +645,7 @@ pub(super) fn is_state_path(relative: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, InventoryEntry, ScopedInventory, collect};
+    use super::{EntryKind, InventoryEntry, ScopedInventory, collect, sanitize_entry_name};
     use crate::commands::sync::scope::SyncScope;
     use crate::ftp::{Entry, Remote, StrictRemote};
     use crate::ignored::Matcher;
@@ -687,10 +709,18 @@ mod tests {
         entry(name, true)
     }
 
+    fn symlink(name: &str) -> Entry {
+        Entry {
+            is_symlink: true,
+            ..entry(name, false)
+        }
+    }
+
     fn entry(name: &str, is_dir: bool) -> Entry {
         Entry {
             name: name.to_string(),
             is_dir,
+            is_symlink: false,
             size: 1,
             modified: Utc.with_ymd_and_hms(2026, 8, 10, 0, 0, 0).unwrap(),
         }
@@ -1603,6 +1633,107 @@ mod tests {
                 presence(Some(EntryKind::Directory), None, false)
             )])
         );
+    }
+
+    #[test]
+    fn a_skipped_symlink_name_is_escaped_before_it_reaches_a_warning() {
+        // `remote_child_name` refuses control characters outright, but a
+        // skipped symlink is only reported -- so the reporting path has to
+        // escape the name itself.
+        let escaped = sanitize_entry_name("link\u{1b}[31m\r\n");
+
+        assert!(!escaped.chars().any(char::is_control));
+        assert!(escaped.starts_with("link"));
+    }
+
+    #[test]
+    fn a_symlink_with_a_control_character_name_still_aborts_the_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut remote = FakeRemote::default()
+            .directory("/remote", vec![file("real.c"), symlink("link\u{1b}name")]);
+
+        // Skipping symlinks must not weaken the unsafe-name check: a control
+        // character in a server-supplied name is a server problem whatever the
+        // record type, and it is refused before the type is even consulted.
+        let error = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::RootDirectory,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("unsafe remote entry"), "got: {message:?}");
+        assert!(!message.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn a_symlink_still_counts_against_the_duplicate_name_guard() {
+        let root = tempfile::tempdir().unwrap();
+        // A server contradicting itself: one name, two record types. Dropping
+        // the symlink before the guard would let the second record through as
+        // an ordinary single-file listing.
+        let mut remote =
+            FakeRemote::default().directory("/remote", vec![symlink("conf"), file("conf")]);
+
+        let error = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::RootDirectory,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("duplicate remote entry"),
+            "got: {:#}",
+            error
+        );
+    }
+
+    #[test]
+    fn inventory_skips_a_remote_symlink_instead_of_aborting() {
+        let root = tempfile::tempdir().unwrap();
+        let mut remote =
+            FakeRemote::default().directory("/remote", vec![file("real.c"), symlink("link.c")]);
+
+        let inventoried = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::RootDirectory,
+        )
+        .unwrap();
+
+        // Aborting here is the bug the PR set out to fix: one symlink anywhere
+        // in the tree took down the whole scoped sync / picker operation.
+        assert!(inventoried.entries.contains_key("real.c"));
+        assert!(!inventoried.entries.contains_key("link.c"));
+    }
+
+    #[test]
+    fn inventory_does_not_descend_through_a_symlinked_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut remote = FakeRemote::default()
+            .directory("/remote", vec![symlink("elsewhere")])
+            .directory("/remote/elsewhere", vec![file("escaped.c")]);
+
+        let inventoried = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::RootDirectory,
+        )
+        .unwrap();
+
+        assert!(
+            inventoried
+                .entries
+                .keys()
+                .all(|key| !key.starts_with("elsewhere"))
+        );
+        assert_eq!(remote.listed, vec!["/remote"]);
     }
 
     #[test]

@@ -11,6 +11,11 @@ pub struct Ftp {
 pub struct Entry {
     pub name: String,
     pub is_dir: bool,
+    /// A POSIX symlink record. Kept out of `is_dir`/`is_file` so consumers
+    /// must decide a policy explicitly: enumeration skips these (they are not
+    /// syncable), and every write path refuses them, because the target can
+    /// resolve outside the configured remote root.
+    pub is_symlink: bool,
     pub size: u64,
     pub modified: DateTime<Utc>,
 }
@@ -193,12 +198,19 @@ fn parse_listing_strict(dir: &str, lines: &[String]) -> Result<Vec<Entry>> {
                 sanitize_for_message(dir)
             )
         })?;
-        if file.is_symlink() {
-            // Do not follow remote symlinks: their targets may escape the
-            // configured remote root and cannot be synchronized safely.
-            continue;
-        }
-        if !file.is_directory() && !file.is_file() {
+        // Symlinks are carried through as entries marked `is_symlink` rather
+        // than dropped. Dropping them here made a symlink indistinguishable
+        // from an absent path, and the guarded write pre-check reads absence
+        // as "safe to create" -- so a STOR followed the link out of the root.
+        // Enumeration skips them and writes refuse them; both need the record.
+        //
+        // Forward-compatibility guard: `suppaftp::list::FileType` has exactly
+        // three variants today (directory, file, symlink), so this bail is
+        // unreachable with suppaftp 6.x. It stays because `entry_from_posix_file`
+        // derives `is_dir` from `is_directory()`, which would silently present
+        // any future variant (socket, device, ...) as a regular file. Refusing
+        // an unknown record type is the fail-closed choice.
+        if !file.is_directory() && !file.is_file() && !file.is_symlink() {
             anyhow::bail!(
                 "ftp list {}: unsupported record type at record {index}",
                 sanitize_for_message(dir)
@@ -213,6 +225,7 @@ fn entry_from_posix_file(file: &suppaftp::list::File) -> Entry {
     Entry {
         name: file.name().to_string(),
         is_dir: file.is_directory(),
+        is_symlink: file.is_symlink(),
         size: u64::try_from(file.size()).unwrap_or(0),
         modified: DateTime::<Utc>::from(file.modified()),
     }
@@ -407,6 +420,9 @@ mod tests {
 
     const VALID_POSIX_FILE: &str = "-rw-r--r-- 1 owner group 42 Jan 1 2000 file.txt";
     const VALID_POSIX_DIRECTORY: &str = "drwxr-xr-x 2 owner group 4096 Jan 1 2000 subdir";
+    /// A symlink record whose target carries an ANSI escape, so tests can
+    /// prove the target never reaches a user-visible message.
+    const ATTACKER_LINK: &str = "lrwxrwxrwx 1 owner group 8 Jan 1 2000 link -> \u{1b}[31mtarget";
 
     #[test]
     fn strict_listing_transport_error_omits_server_response() {
@@ -532,17 +548,69 @@ mod tests {
     }
 
     #[test]
-    fn strict_listing_skips_symlinks_while_tolerant_listing_stays_compatible() {
-        const ATTACKER_LINK: &str =
-            "lrwxrwxrwx 1 owner group 8 Jan 1 2000 link -> \u{1b}[31mtarget";
+    fn strict_listing_marks_a_symlink_record_rather_than_dropping_it() {
         let lines = vec![ATTACKER_LINK.to_string()];
 
-        let strict_entries = parse_listing_strict("/root", &lines).unwrap();
-        assert!(strict_entries.is_empty());
+        let entries = parse_listing_strict("/root", &lines).unwrap();
 
-        let tolerant_entries = parse_listing_tolerant(&lines);
-        assert_eq!(tolerant_entries.len(), 1);
-        assert!(!tolerant_entries[0].is_dir);
+        // Dropping the record would make a symlink indistinguishable from an
+        // absent path, which is what lets a guarded write STOR through it.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "link");
+        assert!(entries[0].is_symlink);
+        assert!(!entries[0].is_dir);
+        // The attacker-controlled link target never enters the data model, so
+        // it cannot reach a message, a path, or a transfer decision.
+        assert!(!entries[0].name.contains("target"));
+        assert!(!entries[0].name.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn tolerant_listing_marks_a_symlink_record() {
+        let lines = vec![ATTACKER_LINK.to_string()];
+
+        let entries = parse_listing_tolerant(&lines);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_symlink);
+        assert!(!entries[0].is_dir);
+    }
+
+    #[test]
+    fn a_symlink_among_valid_records_leaves_every_other_record_intact() {
+        // A single-line fixture cannot tell "handles the symlink" apart from
+        // "drops everything", so pin the survivors explicitly.
+        let lines = vec![
+            VALID_POSIX_FILE.to_string(),
+            ATTACKER_LINK.to_string(),
+            VALID_POSIX_DIRECTORY.to_string(),
+        ];
+
+        let entries = parse_listing_strict("/root", &lines).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.is_dir, entry.is_symlink))
+                .collect::<Vec<_>>(),
+            vec![
+                ("file.txt", false, false),
+                ("link", false, true),
+                ("subdir", true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn listings_do_not_mark_plain_files_or_directories_as_symlinks() {
+        let lines = vec![
+            VALID_POSIX_FILE.to_string(),
+            VALID_POSIX_DIRECTORY.to_string(),
+        ];
+
+        let entries = parse_listing_strict("/root", &lines).unwrap();
+
+        assert!(entries.iter().all(|entry| !entry.is_symlink));
     }
 
     #[test]

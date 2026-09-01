@@ -13,7 +13,8 @@ use crate::commands::remote_hash;
 use crate::commands::sync::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
 use crate::commands::transfer_temp::fresh_remote_candidate;
 use crate::commands::walk::{
-    collect_remote_arg, remote_join, safe_arg, safe_rel, walk_local, walk_remote,
+    collect_remote_arg_with_symlinks, leaf_is_symlink, remote_join, safe_arg, safe_rel, walk_local,
+    walk_remote_with_symlinks,
 };
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
@@ -51,9 +52,20 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     // `push <file>` skips the walks entirely.
     let mut local_paths: BTreeSet<String> = BTreeSet::new();
     let mut remote_paths: BTreeSet<String> = BTreeSet::new();
+    // Remote paths the walk refused to enumerate because the server described
+    // them as symlinks. They are absent from `remote_paths`, and absence alone
+    // classifies as `LocalOnly` -> upload; the server would then resolve the
+    // link and put the write outside the remote root.
+    let mut remote_symlinks: BTreeSet<String> = BTreeSet::new();
     if paths.is_empty() {
         walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
-        walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
+        walk_remote_with_symlinks(
+            &mut ftp,
+            &cfg.paths.remote_root,
+            "",
+            &mut remote_paths,
+            &mut remote_symlinks,
+        )?;
     } else {
         for rel_no_slash in &paths {
             let local_full = local_root.join(rel_no_slash);
@@ -62,11 +74,12 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
             } else if local_full.is_file() {
                 local_paths.insert(rel_no_slash.clone());
             }
-            collect_remote_arg(
+            collect_remote_arg_with_symlinks(
                 &mut ftp,
                 &cfg.paths.remote_root,
                 rel_no_slash,
                 &mut remote_paths,
+                &mut remote_symlinks,
             );
         }
     }
@@ -91,6 +104,15 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     let mut had_conflict = false;
 
     for rel in &targets {
+        // Refuse before classification. Deliberately not overridable by
+        // `--force`: that flag means "overwrite remote edits", never "write
+        // through a link to somewhere outside the remote root".
+        if remote_symlinks.contains(rel) {
+            eprintln!("refusing {rel}: the remote path is a symlink, not a file");
+            had_conflict = true;
+            continue;
+        }
+
         let on_local = local_paths.contains(rel);
         let on_remote = remote_paths.contains(rel);
 
@@ -207,7 +229,9 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
         // tasks.json uses that to surface a "needs --force" message rather
         // than a generic failure.
         return Err(crate::error::Exit::Conflict(
-            "push aborted: one or more files have remote changes (use --force to overwrite)".into(),
+            "push aborted: one or more files have remote changes (use --force to overwrite) \
+             or resolve to a remote symlink"
+                .into(),
         )
         .into());
     }
@@ -254,6 +278,18 @@ pub fn push_one(
             RemotePresence::Present => true,
             RemotePresence::Missing => false,
         };
+        // `push_one` runs no tree walk, so nothing else here can tell a file
+        // from a symlink to one -- `SIZE` and `NLST` both succeed for a link.
+        // One listing of the parent settles it, which is affordable for a
+        // single explicit path (this is the editor's push-on-save path).
+        if remote_exists
+            && leaf_is_symlink(&mut ftp, &cfg.paths.remote_root, &remote_path) == Some(true)
+        {
+            return Err(crate::error::Exit::Conflict(format!(
+                "refusing to push {rel}: the remote path is a symlink, not a file"
+            ))
+            .into());
+        }
         if !remote_exists && local_hash.is_none() {
             anyhow::bail!("neither local nor remote has {rel}");
         }

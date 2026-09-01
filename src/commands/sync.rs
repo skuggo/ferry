@@ -25,7 +25,7 @@ use crate::commands::push::{
     ExpectedLocalSource, ExpectedRemoteDestination, upload_one, upload_one_guarded,
 };
 use crate::commands::remote_hash::{self, RemoteFileRetrieval, RemoteHash};
-use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::commands::walk::{remote_join, walk_local, walk_remote_with_symlinks};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::{Entry, Ftp, Remote, StrictRemote};
@@ -1682,7 +1682,17 @@ fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()
     let mut local_paths: BTreeSet<String> = BTreeSet::new();
     walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
     let mut remote_paths: BTreeSet<String> = BTreeSet::new();
-    walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
+    // Remote paths skipped as symlinks. Absence from `remote_paths` alone
+    // classifies as `LocalOnly` -> upload, and the server would resolve the
+    // link, writing outside the configured remote root.
+    let mut remote_symlinks: BTreeSet<String> = BTreeSet::new();
+    walk_remote_with_symlinks(
+        &mut ftp,
+        &cfg.paths.remote_root,
+        "",
+        &mut remote_paths,
+        &mut remote_symlinks,
+    )?;
 
     // Union of every relative path we know about from any source.
     let mut targets: BTreeSet<String> = BTreeSet::new();
@@ -1695,6 +1705,15 @@ fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()
     let mut had_conflict = false;
 
     for rel in &targets {
+        // Refuse before classification, and deliberately not overridable by
+        // `--force`: that flag means "take local over remote edits", never
+        // "write through a link to somewhere outside the remote root".
+        if remote_symlinks.contains(rel) {
+            eprintln!("refusing {rel}: the remote path is a symlink, not a file");
+            had_conflict = true;
+            continue;
+        }
+
         let on_local = local_paths.contains(rel);
         let on_remote = remote_paths.contains(rel);
 
@@ -1832,7 +1851,8 @@ fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()
         // tasks.json uses that to surface a "needs --force" message rather
         // than a generic failure.
         return Err(crate::error::Exit::Conflict(
-            "sync aborted: one or more files diverged on both sides (use --force to take local)"
+            "sync aborted: one or more files diverged on both sides (use --force to take \
+             local) or resolve to a remote symlink"
                 .into(),
         )
         .into());
