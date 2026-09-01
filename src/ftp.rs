@@ -193,6 +193,11 @@ fn parse_listing_strict(dir: &str, lines: &[String]) -> Result<Vec<Entry>> {
                 sanitize_for_message(dir)
             )
         })?;
+        if file.is_symlink() {
+            // Do not follow remote symlinks: their targets may escape the
+            // configured remote root and cannot be synchronized safely.
+            continue;
+        }
         if !file.is_directory() && !file.is_file() {
             anyhow::bail!(
                 "ftp list {}: unsupported record type at record {index}",
@@ -527,18 +532,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_listing_rejects_symlinks_while_tolerant_listing_stays_compatible() {
+    fn strict_listing_skips_symlinks_while_tolerant_listing_stays_compatible() {
         const ATTACKER_LINK: &str =
             "lrwxrwxrwx 1 owner group 8 Jan 1 2000 link -> \u{1b}[31mtarget";
         let lines = vec![ATTACKER_LINK.to_string()];
 
-        let error = parse_listing_strict("/root", &lines).unwrap_err();
-        let message = format!("{error:#}");
-
-        assert!(message.contains("unsupported record type"));
-        assert!(message.contains("record 0"));
-        assert!(!message.contains('\u{1b}'));
-        assert!(!message.contains("target"));
+        let strict_entries = parse_listing_strict("/root", &lines).unwrap();
+        assert!(strict_entries.is_empty());
 
         let tolerant_entries = parse_listing_tolerant(&lines);
         assert_eq!(tolerant_entries.len(), 1);

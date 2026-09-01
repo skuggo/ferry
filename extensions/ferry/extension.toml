@@ -11,4 +11,4 @@ repository = "https://github.com/simon/zed_ftp"
 # coverage, add "C++" to the languages list here.
 [language_servers.ferry-lsp]
 name = "Ferry LSP"
-languages = ["C"]
+languages = ["C", "C++"]
