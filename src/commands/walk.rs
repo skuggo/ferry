@@ -92,10 +92,18 @@ pub fn walk_remote<R: Remote + ?Sized>(
     sub: &str,
     out: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let dir = if sub.is_empty() {
-        root.trim_end_matches('/').to_string()
+    // Preserve "/" as the FTP root. Trimming it to an empty string makes
+    // LIST use the server's current directory, which can silently point at a
+    // different subtree and corrupt every recursive remote path.
+    let root_dir = if root.trim_end_matches('/').is_empty() {
+        "/".to_string()
     } else {
-        format!("{}/{}", root.trim_end_matches('/'), sub)
+        root.trim_end_matches('/').to_string()
+    };
+    let dir = if sub.is_empty() {
+        root_dir
+    } else {
+        format!("{}/{}", root_dir.trim_end_matches('/'), sub)
     };
     // `sub` may name a single file rather than a directory — `pull`/`push`/`rm`
     // all pass user path args straight through. Settle that with SIZE before
@@ -352,6 +360,28 @@ mod walk_remote_tests {
             out.into_iter().collect::<Vec<_>>(),
             vec!["a.txt", "finger_d.20260729", "sub/b.txt"]
         );
+    }
+
+    #[test]
+    fn preserves_slash_as_the_ftp_root() {
+        let mut f = Fake::new(Echo::AbsolutePath);
+        f.dirs.clear();
+        f.dirs.insert("/".into(), vec![("players".into(), true)]);
+        f.dirs.insert(
+            "/players".into(),
+            vec![("skuggis".into(), true)],
+        );
+        f.dirs.insert(
+            "/players/skuggis".into(),
+            vec![("castle.c".into(), false)],
+        );
+        f.files = vec!["/players/skuggis/castle.c".into()];
+
+        let mut out = BTreeSet::new();
+        walk_remote(&mut f, "/", "", &mut out).unwrap();
+
+        assert_eq!(out.into_iter().collect::<Vec<_>>(), vec!["players/skuggis/castle.c"]);
+        assert_eq!(f.listed.first().map(String::as_str), Some("/"));
     }
 
     #[test]
