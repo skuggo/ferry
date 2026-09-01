@@ -17,7 +17,9 @@ use crate::commands::remote_hash;
 use crate::commands::remote_hash::RemoteHash;
 use crate::commands::sync::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
 use crate::commands::transfer_temp::fresh_local_candidate;
-use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
+use crate::commands::walk::{
+    collect_remote_arg, remote_join, safe_arg, safe_rel, walk_local, walk_remote,
+};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -32,12 +34,26 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Normalize a pull argument. Absolute paths inside local_root remain local
+/// paths; an absolute path outside local_root is interpreted as a path from
+/// the configured remote root. This lets `pull /players/shaman/` work when
+/// local_root is `/home/nicke/3S` and remote_root is `/`.
+fn normalize_pull_arg(local_root: &Path, input: &str) -> Result<String> {
+    if Path::new(input).is_absolute() {
+        if let Ok(relative) = crate::project::relative_to_local_root(local_root, Path::new(input)) {
+            return Ok(relative);
+        }
+        return safe_rel(input.trim_start_matches('/'));
+    }
+    safe_arg(local_root, input)
+}
+
 pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let paths: Vec<String> = paths
         .iter()
-        .map(|path| safe_arg(&local_root, path))
+        .map(|path| normalize_pull_arg(&local_root, path))
         .collect::<Result<_>>()?;
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
@@ -653,6 +669,45 @@ fn record_download(
             last_synced: Utc::now(),
         },
     );
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::normalize_pull_arg;
+    use std::path::Path;
+
+    #[test]
+    fn absolute_remote_directory_is_relative_to_remote_root() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            normalize_pull_arg(root.path(), "/players/shaman/").unwrap(),
+            "players/shaman"
+        );
+    }
+
+    #[test]
+    fn absolute_local_path_inside_root_stays_local_relative() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("players");
+        std::fs::create_dir(&local).unwrap();
+        assert_eq!(
+            normalize_pull_arg(root.path(), local.to_str().unwrap()).unwrap(),
+            "players"
+        );
+    }
+
+    #[test]
+    fn absolute_remote_parent_traversal_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(normalize_pull_arg(root.path(), "/players/../outside").is_err());
+        assert!(
+            normalize_pull_arg(
+                root.path(),
+                Path::new("/players/../outside").to_str().unwrap()
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
