@@ -101,6 +101,31 @@ impl Ftp {
         parse_listing_strict(dir, &lines)
     }
 
+    /// Resolve a symlink leaf from one parent LIST response. This is used only
+    /// by an explicit pull argument; normal walks and all write operations keep
+    /// refusing remote symlinks.
+    pub fn symlink_target(&mut self, path: &str) -> Result<Option<String>> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent, leaf) = trimmed.rsplit_once('/').unwrap_or(("/", trimmed));
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let lines = self
+            .inner
+            .list(Some(parent))
+            .with_context(|| format!("ftp list {parent}"))?;
+        for line in lines {
+            let file = match suppaftp::list::File::from_posix_line(&line) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            if file.name() == leaf && file.is_symlink() {
+                return Ok(file
+                    .symlink()
+                    .map(|target| target.to_string_lossy().into_owned()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Probe exactly one remote pathname through `NLST`. Unlike [`Self::list`]
     /// this is intentionally strict: every returned line must name the
     /// requested path, so malformed, partial, or unrelated replies cannot be

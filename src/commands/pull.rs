@@ -38,6 +38,47 @@ use std::time::SystemTime;
 /// paths; an absolute path outside local_root is interpreted as a path from
 /// the configured remote root. This lets `pull /players/shaman/` work when
 /// local_root is `/home/nicke/3S` and remote_root is `/`.
+fn resolve_pull_symlink(remote_root: &str, link: &str, target: &str) -> Result<String> {
+    let root = remote_root.trim_end_matches('/');
+    let root = if root.is_empty() { "/" } else { root };
+    let link_parent = link
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("/");
+    let absolute = if target.starts_with('/') {
+        target.to_string()
+    } else {
+        format!("{}/{}", link_parent.trim_end_matches('/'), target)
+    };
+    let mut parts = Vec::new();
+    for part in absolute.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    anyhow::bail!("refusing remote symlink {link:?}: target escapes remote root");
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    let resolved_abs = format!("/{}", parts.join("/"));
+    let root_prefix = root.trim_end_matches('/');
+    let rel = if root_prefix.is_empty() {
+        resolved_abs.trim_start_matches('/').to_string()
+    } else if resolved_abs == root_prefix {
+        String::new()
+    } else if let Some(rest) = resolved_abs.strip_prefix(&(root_prefix.to_string() + "/")) {
+        rest.to_string()
+    } else {
+        anyhow::bail!("refusing remote symlink {link:?}: target escapes remote root");
+    };
+    if rel.is_empty() {
+        anyhow::bail!("refusing remote symlink {link:?}: target is remote root");
+    }
+    Ok(rel)
+}
+
 fn normalize_pull_arg(local_root: &Path, input: &str) -> Result<String> {
     if Path::new(input).is_absolute() {
         if let Ok(relative) = crate::project::relative_to_local_root(local_root, Path::new(input)) {
@@ -51,7 +92,7 @@ fn normalize_pull_arg(local_root: &Path, input: &str) -> Result<String> {
 pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let paths: Vec<String> = paths
+    let mut paths: Vec<String> = paths
         .iter()
         .map(|path| normalize_pull_arg(&local_root, path))
         .collect::<Result<_>>()?;
@@ -67,6 +108,20 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
         &cfg.connection.password,
         cfg.connection.passive,
     )?;
+
+    // An explicit pull of a remote symlink is allowed to follow its target,
+    // but only for a target that stays inside remote_root. The resolved target
+    // becomes the local path too, so the mirror contains the actual file rather
+    // than silently pretending to reproduce an FTP symlink.
+    for rel in &mut paths {
+        let remote_path = remote_join(&cfg.paths.remote_root, rel);
+        let Some(target) = ftp.symlink_target(&remote_path)? else {
+            continue;
+        };
+        let resolved = resolve_pull_symlink(&cfg.paths.remote_root, &remote_path, &target)?;
+        eprintln!("following remote symlink {rel} -> {resolved}");
+        *rel = resolved;
+    }
 
     // Scope the walks to the paths we actually care about, and build the
     // target set in one pass so we emit exactly one status message per arg.
