@@ -1111,8 +1111,8 @@ remote_root = "/"
 
     assert_eq!(
         out.status.code(),
-        Some(3),
-        "expected auth exit after loading legacy config; stderr={}",
+        Some(1),
+        "expected connection exit after loading legacy config; stderr={}",
         String::from_utf8_lossy(&out.stderr),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
