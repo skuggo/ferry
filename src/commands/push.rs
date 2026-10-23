@@ -6,8 +6,8 @@
 //! own deliberate command.
 
 use crate::commands::file_transfer::{
-    LocalPathExpectation, RemoteDestinationSnapshot, RemotePresence, RemoteWrite, TransferOutcome,
-    TransferStatus, probe_remote_file,
+    LocalPathExpectation, ProbedRemote, RemoteDestinationSnapshot, RemoteWrite, TransferOutcome,
+    TransferStatus, probe_remote,
 };
 use crate::commands::remote_hash;
 use crate::commands::remote_hash::RemoteHash;
@@ -366,9 +366,9 @@ pub fn push_one(
         let local_hash = local_bytes.as_deref().map(hash_bytes);
 
         let remote_path = remote_join(&cfg.paths.remote_root, &rel);
-        let remote_exists = match probe_remote_file(&mut ftp, &remote_path)? {
-            RemotePresence::Present => true,
-            RemotePresence::Missing => false,
+        let (remote_exists, probed_size) = match probe_remote(&mut ftp, &remote_path)? {
+            ProbedRemote::Present { size } => (true, size),
+            ProbedRemote::Missing => (false, None),
         };
         // `push_one` runs no tree walk, so nothing else here can tell a file
         // from a symlink to one -- `SIZE` and `NLST` both succeed for a link.
@@ -386,7 +386,17 @@ pub fn push_one(
             anyhow::bail!("neither local nor remote has {rel}");
         }
         let remote_hash = if remote_exists {
-            Some(remote_hash::compute(&mut ftp, &mut state, &rel, &remote_path, false)?.sha256)
+            Some(
+                remote_hash::compute_after_probe(
+                    &mut ftp,
+                    &mut state,
+                    &rel,
+                    &remote_path,
+                    false,
+                    probed_size,
+                )?
+                .sha256,
+            )
         } else {
             None
         };

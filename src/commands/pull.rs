@@ -10,6 +10,7 @@ mod prepared;
 pub use prepared::{
     LocalIdentity, PreparedPull, RemoteFile, apply_prepared_pull, apply_prepared_pull_if,
     fetch_remote_one, prepare_force_pull_one, prepare_pull_one, pull_one, pull_one_on,
+    pull_one_with_state,
 };
 
 use crate::commands::file_transfer::LocalPathExpectation;
@@ -384,6 +385,22 @@ fn pull_target(
                     "pulled"
                 }
             );
+        }
+        FileState::Untracked if local_hash == remote_hash_str => {
+            // Identical on both sides, just never recorded: adopt it so
+            // later pulls (and the hook) treat it as tracked.
+            if mode.should_apply() {
+                let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
+                record_download(state, rel, &rh_inner.sha256, rh_inner.size, rh_inner.mtime);
+            }
+        }
+        FileState::Untracked if !force => {
+            let local_size = std::fs::metadata(local_root.join(rel))
+                .with_context(|| format!("reading local {rel}"))?
+                .len();
+            let remote_size = rh.as_ref().map_or(0, |r| r.size);
+            eprintln!("{}", untracked_conflict(rel, local_size, remote_size));
+            return Ok(true);
         }
         FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
             // Untracked = both sides have a file but no record of a prior sync.
@@ -803,6 +820,23 @@ fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp.zedftp");
     PathBuf::from(s)
+}
+
+/// The refusal for a file present on both sides that ferry has never
+/// recorded. Nothing proves the local copy holds edits -- in a mirror seeded
+/// from elsewhere it is more often just stale -- so say so.
+pub(crate) fn untracked_conflict(
+    rel: &str,
+    local_size: u64,
+    remote_size: u64,
+) -> crate::error::Exit {
+    crate::error::Exit::Conflict(format!(
+        "{rel} is not tracked by ferry and differs from the remote \
+         (local {local_size} bytes, remote {remote_size} bytes); the local copy \
+         may be stale. Check it, then run 'ferry pull --force {rel}' to take \
+         the remote copy, or 'ferry push --force {rel}' if the local copy is \
+         the one to keep"
+    ))
 }
 
 fn record_download(

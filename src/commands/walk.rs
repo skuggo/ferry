@@ -66,6 +66,17 @@ pub fn walk_local(
             }
             walk_local(root, &path, matcher, out)?;
         } else {
+            // Only REGULAR files are syncable. A unix socket, FIFO, device
+            // node or dangling symlink has no bytes to transfer, and trying
+            // to hash one fails at the OS level -- `ferry status` aborted
+            // outright on a live tree because a Zed editor socket
+            // (zed-stable.sock) sat inside the sync root and hashing it
+            // returned "No such device or address (os error 6)". Enumerating
+            // them was never useful: FTP could not carry one either, so this
+            // spares push/sync the same failure rather than only status.
+            if !path.is_file() {
+                continue;
+            }
             let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
             // normalize separators on windows; not strictly needed on linux but keeps state portable
             #[cfg(windows)]

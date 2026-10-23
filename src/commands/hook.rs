@@ -108,9 +108,10 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     // cooldown window, skip the pull. Apply mode keeps config loading deferred
     // until we know we're going to act; dry-run loaded it above only to resolve
     // the configured local root for read-through state selection.
-    if let Ok(state) = StateFile::load_or_default(&state_path)
-        && let Some(record) = state.files.get(&rel)
-    {
+    // The state loaded here is handed on to the pull rather than parsed
+    // again: on a large mirror each load is ~10 ms of every hook call.
+    let state = StateFile::load_or_default(&state_path).ok();
+    if let Some(record) = state.as_ref().and_then(|state| state.files.get(&rel)) {
         let elapsed = Utc::now().signed_duration_since(record.last_synced);
         if elapsed.num_seconds() >= 0 && elapsed.num_seconds() < cooldown_secs {
             eprintln!("ferry hook: {tool} {rel} — within {cooldown_secs}s cooldown, skipping pull");
@@ -118,10 +119,37 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
         }
     }
 
-    // Fast single-file pull with force=true. The hook contract is "give me
-    // the current remote version"; users who don't want that shouldn't
-    // install the hook.
-    match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ true, mode) {
+    // Fast single-file pull. The hook contract is "give me the current remote
+    // version" -- but that stops short of discarding work the user has not
+    // pushed yet.
+    //
+    // This used to pass force=true, which made the pull overwrite un-pushed
+    // local edits with no warning and no way to get them back. It is a real
+    // data-loss path, not staleness: an agent that edits a file twice without
+    // pushing in between has its first edit silently reverted by the hook
+    // firing before the second, and the only sign is that the change is
+    // simply not there afterwards. Reproduced as:
+    //
+    //     echo MARKER >> NEWS                       # un-pushed local edit
+    //     echo '{...NEWS...}' | ferry hook -v       # "ferry hook: pulled NEWS"
+    //     grep -c MARKER NEWS                       # 0
+    //
+    // force=false makes pull_one apply the same BothChanged rule the `pull`
+    // subcommand already applies, so a diverged file is reported instead of
+    // clobbered. Recovering staleness costs an explicit `ferry pull`;
+    // recovering a clobbered edit may cost the edit.
+    let pulled = match state {
+        Some(state) => crate::commands::pull::pull_one_with_state(
+            &config_path,
+            &rel,
+            /* force = */ false,
+            mode,
+            state,
+        ),
+        // Unreadable here: let the pull load it and report why.
+        None => crate::commands::pull::pull_one(&config_path, &rel, /* force = */ false, mode),
+    };
+    match pulled {
         Ok(outcome) if outcome.status == TransferStatus::Transferred => {
             if mode.is_dry_run() {
                 eprintln!("ferry hook: would pull {}", outcome.path);
@@ -132,10 +160,33 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
         Ok(_) => {}
         Err(error) => {
             // Don't fail the hook — deny would surprise the user. Just log.
-            eprintln!("ferry hook: pull {rel} failed: {error:#}");
+            // The common case here is a conflict: local has edits that were
+            // never pushed, so the pull is refused and the local copy stands.
+            eprintln!(
+                "ferry hook: not pulling {rel} ({error:#}) -- \
+                 local copy kept; run 'ferry push {rel}' or an explicit \
+                 'ferry pull {rel}' to reconcile"
+            );
+            // stderr from an exit-0 PreToolUse hook never reaches the agent,
+            // so on its own the tool call goes ahead on a possibly stale copy
+            // with no sign anything was wrong. additionalContext does.
+            println!("{}", agent_notice(&rel, &error));
         }
     }
     Ok(())
+}
+
+/// Claude Code PreToolUse output carrying `error` into the agent's context.
+fn agent_notice(rel: &str, error: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": format!(
+                "ferry did NOT refresh {rel} from the server, so the local copy \
+                 you are about to use may not match it: {error:#}"
+            ),
+        }
+    })
 }
 
 #[cfg(test)]
