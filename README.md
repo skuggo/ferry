@@ -67,6 +67,25 @@ ferry init --no-validate
 This writes a `.ferry.toml` to the project root and appends it to
 `.gitignore`.
 
+### Working from a subdirectory
+
+Like git, ferry finds `.ferry.toml` by searching upward from the current
+directory, and path arguments are relative to where you are. Run with no
+paths in a subdirectory, `status`, `pull`, `push`, `sync` and `ls` cover just
+that subtree:
+
+```sh
+cd players/knights
+ferry status            # players/knights/** only
+ferry pull castle.c     # players/knights/castle.c
+ferry push ../NEWS.c    # players/NEWS.c
+ferry status ../..      # a path that resolves to the root: the whole project
+```
+
+From the project root, no paths still means the whole project. `rm` and `cc`
+never default to the current directory: they act only on paths you name.
+Absolute paths inside the project work from anywhere.
+
 ## Dry runs
 
 Add `--dry-run` anywhere in a Ferry command to preview write-capable commands
@@ -92,7 +111,9 @@ also suppresses its normally hidden state-cache update. The observational
 
 ## Scoped sync
 
-`ferry sync` with no path retains Ferry's established project-wide behavior.
+`ferry sync` with no path at the project root retains Ferry's established
+project-wide behavior; in a subdirectory it syncs that subtree (see
+[Working from a subdirectory](#working-from-a-subdirectory)).
 To limit reconciliation, pass exactly one file or directory, or use the
 interactive picker:
 
@@ -104,8 +125,8 @@ ferry sync areas --dry-run
 ferry sync areas --force
 ```
 
-`sync PATH` accepts one path relative to the configured `local_root`, or an
-absolute path contained by that root. A directory path is recursive. `PATH`
+`sync PATH` accepts one path relative to the current directory, or an
+absolute path contained by the configured `local_root`. A directory path is recursive. `PATH`
 and `--select` are mutually exclusive. The picker merges the current local and
 remote directory, including remote-only roots, and closes after one file or
 folder is selected. Selecting a folder runs the same recursive scoped sync as

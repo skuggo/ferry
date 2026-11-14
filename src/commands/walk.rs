@@ -66,6 +66,17 @@ pub fn walk_local(
             }
             walk_local(root, &path, matcher, out)?;
         } else {
+            // Only REGULAR files are syncable. A unix socket, FIFO, device
+            // node or dangling symlink has no bytes to transfer, and trying
+            // to hash one fails at the OS level -- `ferry status` aborted
+            // outright on a live tree because a Zed editor socket
+            // (zed-stable.sock) sat inside the sync root and hashing it
+            // returned "No such device or address (os error 6)". Enumerating
+            // them was never useful: FTP could not carry one either, so this
+            // spares push/sync the same failure rather than only status.
+            if !path.is_file() {
+                continue;
+            }
             let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
             // normalize separators on windows; not strictly needed on linux but keeps state portable
             #[cfg(windows)]
@@ -167,7 +178,7 @@ pub fn walk_remote_with_symlinks<R: Remote + ?Sized>(
 /// logic. Consolidating all three (ideally by normalizing once in
 /// `Config::load`, which already does this for `local_root`) is worth a
 /// follow-up, but is deliberately out of scope here.
-fn listable_remote_root(root: &str) -> String {
+pub(crate) fn listable_remote_root(root: &str) -> String {
     let trimmed = root.trim_end_matches('/');
     if trimmed.is_empty() {
         "/".to_string()
@@ -265,7 +276,7 @@ fn is_under(root: &str, path: &str) -> bool {
 /// they still denote a direct child inside `root`; anything that would steer
 /// the walk elsewhere (a sibling tree, a parent, a deeper grandchild) is
 /// rejected so a corrupt or hostile listing can't escape the sync root.
-fn child_name<'a>(root: &str, dir: &str, name: &'a str) -> Option<&'a str> {
+pub(crate) fn child_name<'a>(root: &str, dir: &str, name: &'a str) -> Option<&'a str> {
     if name.is_empty() || name == "." || name == ".." {
         return None;
     }

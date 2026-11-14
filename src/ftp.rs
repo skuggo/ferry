@@ -547,6 +547,41 @@ fn walk_worker(
     Some((out, syms, ftp.listed, ftp.known_dirs))
 }
 
+/// True when `error` carries a 450/550 reply whose text says the path does
+/// not exist (as opposed to e.g. "Permission denied", which shares 550).
+pub(crate) fn is_no_such_file(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<suppaftp::FtpError>(),
+            Some(suppaftp::FtpError::UnexpectedResponse(response))
+                if matches!(
+                    response.status,
+                    suppaftp::Status::RequestFileActionIgnored | suppaftp::Status::FileUnavailable
+                ) && String::from_utf8_lossy(&response.body)
+                    .to_ascii_lowercase()
+                    .contains("no such file")
+        )
+    })
+}
+
+/// True when `error` carries a reply saying the server does not implement
+/// the command at all (500/502/504) -- a property of the server, unlike a
+/// per-path 550.
+pub(crate) fn is_command_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<suppaftp::FtpError>(),
+            Some(suppaftp::FtpError::UnexpectedResponse(response))
+                if matches!(
+                    response.status,
+                    suppaftp::Status::BadCommand
+                        | suppaftp::Status::NotImplemented
+                        | suppaftp::Status::NotImplementedParameter
+                )
+        )
+    })
+}
+
 fn strict_list_transport_error(dir: &str, _error: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!(
         "ftp list {}: remote listing failed",

@@ -40,19 +40,30 @@ enum Cmd {
     /// itself; exits after 15 idle minutes).
     #[command(hide = true)]
     Hookd,
-    /// Show per-file sync state vs remote.
-    Status,
+    /// Show per-file sync state vs remote. PATHS (files or directories,
+    /// relative to the current directory) limit the report; with none, a
+    /// subdirectory of the project reports just that subtree.
+    Status { paths: Vec<String> },
     /// Download remote -> local.
     Pull {
         paths: Vec<String>,
         #[arg(long)]
         force: bool,
+        /// Also delete local files the remote no longer has: only untouched
+        /// copies of synced files, and only once a listing proves them gone.
+        /// Needs explicit paths.
+        #[arg(long)]
+        prune: bool,
     },
     /// Upload local -> remote.
     Push {
         paths: Vec<String>,
         #[arg(long)]
         force: bool,
+        /// Also delete remote files that were deleted locally: only untouched
+        /// copies of synced files. Needs explicit paths that exist locally.
+        #[arg(long)]
+        prune: bool,
     },
     /// Pull then push; refuses on conflict unless --force.
     Sync {
@@ -142,24 +153,62 @@ fn run() -> i32 {
             }
         }
     }
-    let result: anyhow::Result<()> = match cli.cmd {
-        Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate, mode),
-        Cmd::Ls { path } => ferry::commands::ls::run(&cfg, path.as_deref()),
-        Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown, mode),
-        Cmd::Hookd => ferry::commands::hookd::run(&cfg),
-        Cmd::Status => ferry::commands::status::run(&cfg, mode),
-        Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
-        Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
-        Cmd::Sync {
-            path,
-            select,
-            force,
-        } => ferry::commands::sync::run_cli(&cfg, path.as_deref(), select, force, mode),
-        Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
-        Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
-        Cmd::Clean { paths, hours } => ferry::commands::clean::run(&cfg, &paths, hours, mode),
-    };
+    let result: anyhow::Result<()> = (|| {
+        // Like git: relative paths are taken from the working directory, and
+        // a command run in a subdirectory with no paths covers that subtree.
+        let offset = cwd_offset_for(&cli.cmd, &cfg);
+        let rebase = |paths: &[String], default_to_cwd| {
+            ferry::project::rebase_cli_paths(offset.as_deref(), paths, default_to_cwd)
+        };
+        let rebase_one = |path: Option<String>| -> anyhow::Result<Option<String>> {
+            Ok(rebase(&Vec::from_iter(path), true)?.into_iter().next())
+        };
+        match cli.cmd {
+            Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate, mode),
+            Cmd::Ls { path } => ferry::commands::ls::run(&cfg, rebase_one(path)?.as_deref()),
+            Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown, mode),
+            Cmd::Hookd => ferry::commands::hookd::run(&cfg),
+            Cmd::Status { paths } => {
+                ferry::commands::status::run(&cfg, &rebase(&paths, true)?, mode)
+            }
+            Cmd::Pull { paths, force, prune } => {
+                ferry::commands::pull::run(&cfg, &rebase(&paths, true)?, force, prune, mode)
+            }
+            Cmd::Push { paths, force, prune } => {
+                ferry::commands::push::run(&cfg, &rebase(&paths, true)?, force, prune, mode)
+            }
+            Cmd::Sync {
+                path,
+                select,
+                force,
+            } => {
+                let path = if select { path } else { rebase_one(path)? };
+                ferry::commands::sync::run_cli(&cfg, path.as_deref(), select, force, mode)
+            }
+            // Never defaulted: a bare `rm` in a subdirectory must not delete it.
+            Cmd::Rm { paths, recursive } => {
+                ferry::commands::rm::run(&cfg, &rebase(&paths, false)?, recursive, mode)
+            }
+            Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &rebase(&paths, false)?),
+            Cmd::Clean { paths, hours } => {
+                ferry::commands::clean::run(&cfg, &rebase(&paths, false)?, hours, mode)
+            }
+        }
+    })();
     finish(result)
+}
+
+/// Where the working directory sits inside the project `cfg` describes, for
+/// commands that take project paths. `None` (no rebasing) when the config
+/// cannot be read -- the command reports that itself -- or the working
+/// directory is outside `local_root`.
+fn cwd_offset_for(cmd: &Cmd, cfg: &std::path::Path) -> Option<String> {
+    if matches!(cmd, Cmd::Init { .. } | Cmd::Hook { .. } | Cmd::Hookd) {
+        return None;
+    }
+    let config = ferry::config::Config::load(cfg).ok()?;
+    let cwd = std::env::current_dir().ok()?;
+    ferry::project::cwd_offset(&config.paths.local_root, &cwd)
 }
 
 fn finish(result: anyhow::Result<()>) -> i32 {

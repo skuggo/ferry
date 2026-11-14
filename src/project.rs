@@ -158,6 +158,70 @@ pub fn relative_to_local_root(local_root: &Path, path: &Path) -> Result<String> 
     }
 }
 
+/// Where `cwd` sits inside `local_root`, as a project-relative path: `""` at
+/// the root itself, `None` when `cwd` is not inside the project at all.
+pub fn cwd_offset(local_root: &Path, cwd: &Path) -> Option<String> {
+    let local_root = local_root.canonicalize().ok()?;
+    let cwd = cwd.canonicalize().ok()?;
+    let relative = cwd.strip_prefix(&local_root).ok()?;
+    let relative = relative.to_str()?;
+    #[cfg(windows)]
+    let relative = relative.replace('\\', "/");
+    Some(relative.to_owned())
+}
+
+/// Rebase CLI path arguments the way git does: a relative argument names a
+/// path relative to the working directory (`offset`, from [`cwd_offset`]),
+/// and comes back relative to the project root. Absolute arguments pass
+/// through for the commands to contain as before.
+///
+/// An empty result means "the whole project". With `default_to_cwd`, no
+/// arguments in a subdirectory scope to that subdirectory; an argument that
+/// resolves to the root itself widens the result to the whole project.
+/// Without an offset (working directory outside `local_root`) arguments keep
+/// their historical root-relative meaning.
+pub fn rebase_cli_paths(
+    offset: Option<&str>,
+    args: &[String],
+    default_to_cwd: bool,
+) -> Result<Vec<String>> {
+    let Some(offset) = offset else {
+        return Ok(args.to_vec());
+    };
+    if args.is_empty() {
+        return Ok(if default_to_cwd && !offset.is_empty() {
+            vec![offset.to_string()]
+        } else {
+            Vec::new()
+        });
+    }
+
+    let mut rebased = Vec::with_capacity(args.len());
+    for arg in args {
+        if Path::new(arg).is_absolute() {
+            rebased.push(arg.clone());
+            continue;
+        }
+        let mut segments: Vec<&str> = offset.split('/').filter(|s| !s.is_empty()).collect();
+        for segment in arg.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    if segments.pop().is_none() {
+                        anyhow::bail!("refusing path {arg:?}: it resolves outside the project");
+                    }
+                }
+                name => segments.push(name),
+            }
+        }
+        if segments.is_empty() {
+            return Ok(Vec::new());
+        }
+        rebased.push(segments.join("/"));
+    }
+    Ok(rebased)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +520,117 @@ mod tests {
 
         let error = relative_to_local_root(tmp.path(), &path).unwrap_err();
         assert!(error.to_string().contains("UTF-8"));
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    fn rebased(offset: Option<&str>, list: &[&str], default_to_cwd: bool) -> Vec<String> {
+        rebase_cli_paths(offset, &args(list), default_to_cwd).unwrap()
+    }
+
+    #[test]
+    fn cwd_offset_locates_the_cwd_inside_local_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("players/knights");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            cwd_offset(tmp.path(), &nested),
+            Some("players/knights".to_string())
+        );
+        assert_eq!(cwd_offset(tmp.path(), tmp.path()), Some(String::new()));
+    }
+
+    #[test]
+    fn cwd_offset_is_none_outside_local_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("mirror");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        assert_eq!(cwd_offset(&root, &elsewhere), None);
+        assert_eq!(cwd_offset(&root, tmp.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_offset_sees_through_a_symlinked_local_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            cwd_offset(&link, &real.join("sub")),
+            Some("sub".to_string())
+        );
+    }
+
+    #[test]
+    fn relative_args_are_taken_from_the_cwd() {
+        let offset = Some("players/knights");
+        assert_eq!(
+            rebased(offset, &["castle.c"], true),
+            ["players/knights/castle.c"]
+        );
+        assert_eq!(rebased(offset, &["."], true), ["players/knights"]);
+        assert_eq!(
+            rebased(offset, &["./gobj/"], true),
+            ["players/knights/gobj"]
+        );
+        assert_eq!(rebased(offset, &[".."], true), ["players"]);
+        assert_eq!(rebased(offset, &["../../NEWS"], true), ["NEWS"]);
+        assert_eq!(
+            rebased(offset, &["a/./b/../c"], true),
+            ["players/knights/a/c"]
+        );
+    }
+
+    #[test]
+    fn no_args_in_a_subdirectory_scope_to_it_when_defaulting() {
+        assert_eq!(
+            rebased(Some("players/knights"), &[], true),
+            ["players/knights"]
+        );
+        assert!(rebased(Some("players/knights"), &[], false).is_empty());
+        assert!(rebased(Some(""), &[], true).is_empty());
+    }
+
+    // Empty means "the whole project" to every scoped command.
+    #[test]
+    fn an_arg_naming_the_root_means_the_whole_project() {
+        assert!(rebased(Some("players/knights"), &["../.."], true).is_empty());
+        assert!(rebased(Some("players/knights"), &["../..", "castle.c"], true).is_empty());
+        assert!(rebased(Some(""), &["."], true).is_empty());
+    }
+
+    #[test]
+    fn args_escaping_the_project_are_refused() {
+        let error =
+            rebase_cli_paths(Some("players"), &args(&["../../etc/passwd"]), true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("outside the project"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn absolute_args_pass_through_untouched() {
+        assert_eq!(
+            rebased(Some("players"), &["/home/simon/code/3s/NEWS"], true),
+            ["/home/simon/code/3s/NEWS"]
+        );
+    }
+
+    // Outside local_root there is no offset to apply: keep the historical
+    // root-relative meaning rather than guess.
+    #[test]
+    fn without_an_offset_args_keep_their_root_relative_meaning() {
+        assert_eq!(rebased(None, &["players/x.c"], true), ["players/x.c"]);
+        assert!(rebased(None, &[], true).is_empty());
     }
 }

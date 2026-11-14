@@ -8,9 +8,9 @@
 //! and `SIZE` against the cached values in `state.files[rel]`. If both match
 //! we trust the cached `sha256` and skip the download entirely.
 //!
-//! Falls back to always-hashing when the server doesn't support MDTM. The
-//! fallback decision is cached in `state.server_supports_mdtm` so we don't
-//! re-probe every run.
+//! Falls back to always-hashing when the server doesn't support MDTM (it
+//! answers MDTM with 500/502/504). The fallback decision is cached in
+//! `state.server_supports_mdtm` so we don't re-probe every run.
 
 use crate::commands::walk::remote_join;
 use crate::config::Config;
@@ -135,12 +135,37 @@ pub fn compute(
     compute_with(ftp, state, rel, remote_path, want_bytes)
 }
 
+/// [`compute`] for a caller that has just probed the remote `SIZE` itself
+/// (to prove the file exists), so the fast path does not ask again. `None`
+/// (the server gave no size) asks as usual.
+pub fn compute_after_probe(
+    ftp: &mut Ftp,
+    state: &mut StateFile,
+    rel: &str,
+    remote_path: &str,
+    want_bytes: bool,
+    probed_size: Option<u64>,
+) -> Result<RemoteHash> {
+    compute_inner(ftp, state, rel, remote_path, want_bytes, probed_size)
+}
+
 pub(crate) fn compute_with<R: RemoteFileRetrieval>(
     remote: &mut R,
     state: &mut StateFile,
     rel: &str,
     remote_path: &str,
     want_bytes: bool,
+) -> Result<RemoteHash> {
+    compute_inner(remote, state, rel, remote_path, want_bytes, None)
+}
+
+fn compute_inner<R: RemoteFileRetrieval>(
+    remote: &mut R,
+    state: &mut StateFile,
+    rel: &str,
+    remote_path: &str,
+    want_bytes: bool,
+    known_size: Option<u64>,
 ) -> Result<RemoteHash> {
     // Listing fast path: no round trips at all when this session's LIST
     // already proves the file unchanged since the recorded sync.
@@ -166,14 +191,22 @@ pub(crate) fn compute_with<R: RemoteFileRetrieval>(
     let pre_download = if state.server_supports_mdtm.unwrap_or(true) {
         match remote.mtime(remote_path) {
             Ok(mtime) => {
-                let size = remote.size(remote_path).ok();
+                let size = match known_size {
+                    Some(size) => Some(size),
+                    None => remote.size(remote_path).ok(),
+                };
                 if state.server_supports_mdtm.is_none() {
                     state.server_supports_mdtm = Some(true);
                 }
                 Some(RemoteMetadata { mtime, size })
             }
-            Err(_) => {
-                state.server_supports_mdtm = Some(false);
+            // Only a server that rejects the command itself loses the fast
+            // path. Any other failure (typically a 550 for one path it cannot
+            // stat) is about this file: hash it the slow way and move on.
+            Err(error) => {
+                if crate::ftp::is_command_unsupported(&error) {
+                    state.server_supports_mdtm = Some(false);
+                }
                 None
             }
         }
@@ -698,5 +731,119 @@ mod tests {
         assert_eq!(hash.sha256, hash_bytes(payload));
         assert_eq!(hash.size, payload.len() as u64);
         assert_eq!(hash.mtime, mtime);
+    }
+
+    /// MDTM answers with a fixed FTP reply; everything else succeeds.
+    struct MdtmReplies {
+        code: u32,
+        body: &'static str,
+        payload: Vec<u8>,
+    }
+
+    impl RemoteFileRetrieval for MdtmReplies {
+        fn mtime(&mut self, _remote_path: &str) -> Result<DateTime<Utc>> {
+            Err(anyhow::Error::new(suppaftp::FtpError::UnexpectedResponse(
+                suppaftp::types::Response::new(
+                    suppaftp::Status::from(self.code),
+                    self.body.as_bytes().to_vec(),
+                ),
+            ))
+            .context("ftp mtime"))
+        }
+
+        fn size(&mut self, _remote_path: &str) -> Result<u64> {
+            Ok(self.payload.len() as u64)
+        }
+
+        fn download(&mut self, _remote_path: &str) -> Result<Vec<u8>> {
+            Ok(self.payload.clone())
+        }
+    }
+
+    fn mdtm_flag_after(code: u32, body: &'static str, before: Option<bool>) -> Option<bool> {
+        let mut remote = MdtmReplies {
+            code,
+            body,
+            payload: b"bytes".to_vec(),
+        };
+        let mut state = StateFile {
+            server_supports_mdtm: before,
+            ..StateFile::default()
+        };
+        let hash = compute_with(&mut remote, &mut state, "a.c", "/a.c", true).unwrap();
+        assert_eq!(hash.sha256, hash_bytes(b"bytes"));
+        state.server_supports_mdtm
+    }
+
+    // One path the server cannot stat (3k.org lists /all_explorer_rooms but
+    // answers 550 for it) says nothing about MDTM support for every other
+    // file. Recording `false` here used to switch the fast path off for the
+    // whole project, permanently.
+    #[test]
+    fn a_per_file_550_does_not_disable_mdtm() {
+        let body = "550 /all_explorer_rooms: No such file or directory";
+        assert_eq!(mdtm_flag_after(550, body, None), None);
+        assert_eq!(mdtm_flag_after(550, body, Some(true)), Some(true));
+    }
+
+    #[test]
+    fn an_unimplemented_command_reply_disables_mdtm() {
+        assert_eq!(
+            mdtm_flag_after(500, "500 MDTM not understood", None),
+            Some(false)
+        );
+        assert_eq!(
+            mdtm_flag_after(502, "502 Command not implemented", Some(true)),
+            Some(false)
+        );
+    }
+
+    // The single-file paths have just asked SIZE to prove the file exists;
+    // asking again is one more ~100 ms round trip on every hook call.
+    #[test]
+    fn a_known_size_skips_the_size_probe_on_a_cache_hit() {
+        let mtime = timestamp(0);
+        let payload = b"cached remote payload";
+        let mut remote = ScriptedRetrieval::new([Some(mtime)], [], b"must not download");
+        let mut state = cached_state("page.txt", payload, mtime);
+
+        let hash = compute_inner(
+            &mut remote,
+            &mut state,
+            "page.txt",
+            "/remote/page.txt",
+            true,
+            Some(payload.len() as u64),
+        )
+        .unwrap();
+
+        assert_eq!(remote.events, ["MDTM"]);
+        assert!(hash.from_cache);
+    }
+
+    #[test]
+    fn a_known_size_that_disagrees_with_state_still_downloads() {
+        let mtime = timestamp(0);
+        let payload = b"new remote payload, longer";
+        let mut remote = ScriptedRetrieval::new(
+            [Some(mtime), Some(mtime)],
+            [Some(payload.len() as u64)],
+            payload,
+        );
+        let mut state = cached_state("page.txt", b"old", mtime);
+
+        let hash = compute_inner(
+            &mut remote,
+            &mut state,
+            "page.txt",
+            "/remote/page.txt",
+            true,
+            Some(payload.len() as u64),
+        )
+        .unwrap();
+
+        assert_eq!(remote.events, ["MDTM", "RETR", "MDTM", "SIZE"]);
+        assert!(!hash.from_cache);
+        assert_eq!(hash.sha256, hash_bytes(payload));
     }
 }
