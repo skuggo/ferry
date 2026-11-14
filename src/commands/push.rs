@@ -28,13 +28,22 @@ use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
+pub fn run(
+    config_path: &Path,
+    paths: &[String],
+    force: bool,
+    prune: bool,
+    mode: ExecutionMode,
+) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let paths: Vec<String> = paths
         .iter()
         .map(|path| safe_arg(&local_root, path))
         .collect::<Result<_>>()?;
+    if prune {
+        crate::commands::prune::check_args(&paths, &local_root, true)?;
+    }
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
@@ -150,6 +159,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                     &remote_symlinks,
                     rel,
                     force,
+                    prune,
                     mode,
                     pre.take(),
                 ) {
@@ -208,6 +218,7 @@ fn push_target(
     remote_symlinks: &BTreeSet<String>,
     rel: &String,
     force: bool,
+    prune: bool,
     mode: ExecutionMode,
     prefetched: Option<RemoteHash>,
 ) -> Result<bool> {
@@ -283,7 +294,13 @@ fn push_target(
         }
         FileState::RemoteOnly => {
             // Push is one-way: don't delete the remote file just because
-            // the local mirror is missing it. The user can `rm` deliberately.
+            // the local mirror is missing it -- unless --prune asked, and then
+            // only an untouched copy of a file deleted locally since its sync.
+            if prune && let Some(h) = remote_hash.as_deref() {
+                crate::commands::prune::prune_remote(
+                    ftp, state, local_root, &remote_path, rel, h, mode,
+                )?;
+            }
         }
         FileState::LocalOnly | FileState::LocalChanged => {
             let bytes = local_bytes

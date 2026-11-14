@@ -178,7 +178,7 @@ pub fn walk_remote_with_symlinks<R: Remote + ?Sized>(
 /// logic. Consolidating all three (ideally by normalizing once in
 /// `Config::load`, which already does this for `local_root`) is worth a
 /// follow-up, but is deliberately out of scope here.
-fn listable_remote_root(root: &str) -> String {
+pub(crate) fn listable_remote_root(root: &str) -> String {
     let trimmed = root.trim_end_matches('/');
     if trimmed.is_empty() {
         "/".to_string()
@@ -276,7 +276,7 @@ fn is_under(root: &str, path: &str) -> bool {
 /// they still denote a direct child inside `root`; anything that would steer
 /// the walk elsewhere (a sibling tree, a parent, a deeper grandchild) is
 /// rejected so a corrupt or hostile listing can't escape the sync root.
-fn child_name<'a>(root: &str, dir: &str, name: &'a str) -> Option<&'a str> {
+pub(crate) fn child_name<'a>(root: &str, dir: &str, name: &'a str) -> Option<&'a str> {
     if name.is_empty() || name == "." || name == ".." {
         return None;
     }

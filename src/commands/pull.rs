@@ -90,13 +90,22 @@ fn normalize_pull_arg(local_root: &Path, input: &str) -> Result<String> {
     safe_arg(local_root, input)
 }
 
-pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
+pub fn run(
+    config_path: &Path,
+    paths: &[String],
+    force: bool,
+    prune: bool,
+    mode: ExecutionMode,
+) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let mut paths: Vec<String> = paths
         .iter()
         .map(|path| normalize_pull_arg(&local_root, path))
         .collect::<Result<_>>()?;
+    if prune {
+        crate::commands::prune::check_args(&paths, &local_root, false)?;
+    }
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
@@ -232,6 +241,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                     &remote_paths,
                     rel,
                     force,
+                    prune,
                     mode,
                     pre.take(),
                 ) {
@@ -288,6 +298,7 @@ fn pull_target(
     remote_paths: &BTreeSet<String>,
     rel: &String,
     force: bool,
+    prune: bool,
     mode: ExecutionMode,
     prefetched: Option<RemoteHash>,
 ) -> Result<bool> {
@@ -348,8 +359,14 @@ fn pull_target(
             }
         }
         FileState::LocalOnly => {
-            // Pull is one-way: we don't delete local files because the
-            // remote is missing them. Skip.
+            // Pull is one-way: it never deletes a local file just because the
+            // remote lacks it -- unless --prune asked, and then only an
+            // untouched copy the remote provably no longer has.
+            if prune && let Some(h) = local_hash.as_deref() {
+                crate::commands::prune::prune_local(
+                    ftp, state, local_root, remote_root, rel, h, mode,
+                )?;
+            }
         }
         FileState::RemoteOnly | FileState::RemoteChanged => {
             // We need the actual remote bytes to write locally. If the

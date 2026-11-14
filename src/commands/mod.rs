@@ -97,6 +97,7 @@ pub mod hook;
 pub mod hookd;
 pub mod init;
 pub mod ls;
+pub mod prune;
 pub mod pull;
 pub mod push;
 pub mod remote_hash;

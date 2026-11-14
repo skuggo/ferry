@@ -49,12 +49,21 @@ enum Cmd {
         paths: Vec<String>,
         #[arg(long)]
         force: bool,
+        /// Also delete local files the remote no longer has: only untouched
+        /// copies of synced files, and only once a listing proves them gone.
+        /// Needs explicit paths.
+        #[arg(long)]
+        prune: bool,
     },
     /// Upload local -> remote.
     Push {
         paths: Vec<String>,
         #[arg(long)]
         force: bool,
+        /// Also delete remote files that were deleted locally: only untouched
+        /// copies of synced files. Needs explicit paths that exist locally.
+        #[arg(long)]
+        prune: bool,
     },
     /// Pull then push; refuses on conflict unless --force.
     Sync {
@@ -162,11 +171,11 @@ fn run() -> i32 {
             Cmd::Status { paths } => {
                 ferry::commands::status::run(&cfg, &rebase(&paths, true)?, mode)
             }
-            Cmd::Pull { paths, force } => {
-                ferry::commands::pull::run(&cfg, &rebase(&paths, true)?, force, mode)
+            Cmd::Pull { paths, force, prune } => {
+                ferry::commands::pull::run(&cfg, &rebase(&paths, true)?, force, prune, mode)
             }
-            Cmd::Push { paths, force } => {
-                ferry::commands::push::run(&cfg, &rebase(&paths, true)?, force, mode)
+            Cmd::Push { paths, force, prune } => {
+                ferry::commands::push::run(&cfg, &rebase(&paths, true)?, force, prune, mode)
             }
             Cmd::Sync {
                 path,
