@@ -2,35 +2,24 @@
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
 use std::process::Command;
-use testcontainers::{
-    Container, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-};
-
-fn start_ftp() -> (String, u16, Container<GenericImage>) {
-    let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
-        .with_exposed_port(21.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("vsftpd"))
-        .with_env_var("USERS", "test|testpw|/home/test");
-    let container = img.start().unwrap();
-    let port = container.get_host_port_ipv4(21.tcp()).unwrap();
-    ("127.0.0.1".into(), port, container)
-}
+mod support;
+use support::{remote_path, start_ftp, write_config};
 
 #[test]
 #[ignore]
 fn status_reports_per_file_state() {
-    let (host, port, _c) = start_ftp();
+    let fixture = start_ftp();
 
     // Seed remote with three files.
-    let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
     let in_sync_contents: &[u8] = b"same on both sides\n";
     let remote_changed_contents: &[u8] = b"remote version\n";
-    ftp.upload_bytes("/in_sync.txt", in_sync_contents).unwrap();
-    ftp.upload_bytes("/remote_changed.txt", remote_changed_contents)
+    ftp.upload_bytes(&remote_path("in_sync.txt"), in_sync_contents)
         .unwrap();
-    ftp.upload_bytes("/remote_only.txt", b"only on remote\n")
+    ftp.upload_bytes(&remote_path("remote_changed.txt"), remote_changed_contents)
+        .unwrap();
+    ftp.upload_bytes(&remote_path("remote_only.txt"), b"only on remote\n")
         .unwrap();
 
     // Local workdir mirroring most of remote, plus a local-only file.
@@ -69,25 +58,7 @@ fn status_reports_per_file_state() {
     state.save(&state_dir.join("state.json")).unwrap();
 
     // Write the config pointing at the container.
-    let cfg_path = local_root.join(".ferry.toml");
-    let cfg = format!(
-        r#"
-[connection]
-host = "{host}"
-port = {port}
-user = "test"
-password = "testpw"
-passive = true
-
-[paths]
-local_root = "{root}"
-remote_root = "/"
-"#,
-        host = host,
-        port = port,
-        root = local_root.display(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
+    let cfg_path = write_config(local_root, &fixture);
 
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")

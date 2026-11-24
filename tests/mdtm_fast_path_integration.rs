@@ -34,60 +34,25 @@
 
 use ferry::ftp::Ftp;
 use std::process::Command;
-use testcontainers::{
-    Container, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-};
-
-fn start_ftp() -> (String, u16, Container<GenericImage>) {
-    let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
-        .with_exposed_port(21.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("vsftpd"))
-        .with_env_var("USERS", "test|testpw|/home/test");
-    let container = img.start().unwrap();
-    let port = container.get_host_port_ipv4(21.tcp()).unwrap();
-    ("127.0.0.1".into(), port, container)
-}
-
-fn write_config(local_root: &std::path::Path, host: &str, port: u16) -> std::path::PathBuf {
-    let cfg_path = local_root.join(".ferry.toml");
-    let cfg = format!(
-        r#"
-[connection]
-host = "{host}"
-port = {port}
-user = "test"
-password = "testpw"
-passive = true
-
-[paths]
-local_root = "{root}"
-remote_root = "/"
-"#,
-        host = host,
-        port = port,
-        root = local_root.display(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
-    cfg_path
-}
+mod support;
+use support::{remote_path, start_ftp, write_config};
 
 #[test]
 #[ignore]
 fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
-    let (host, port, _c) = start_ftp();
+    let fixture = start_ftp();
 
     // Seed a single file.
-    let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
     let bytes: &[u8] = b"hello fast-path\n";
-    ftp.upload_bytes("/hello.txt", bytes).unwrap();
+    ftp.upload_bytes(&remote_path("hello.txt"), bytes).unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
     let local_root = workdir.path();
     std::fs::write(local_root.join("hello.txt"), bytes).unwrap();
 
-    let cfg_path = write_config(local_root, &host, port);
+    let cfg_path = write_config(local_root, &fixture);
 
     // First sync: populates state.files["hello.txt"] with (sha256, size,
     // remote_mtime). After this, the fast path should fire on subsequent
