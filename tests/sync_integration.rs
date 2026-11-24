@@ -2,64 +2,25 @@
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
 use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant};
-use testcontainers::{
-    Container, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-};
+mod support;
+use support::{FtpFixture, remote_path, start_ftp};
 
-fn start_ftp() -> (String, u16, Container<GenericImage>) {
-    let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
-        .with_exposed_port(21.tcp())
-        .with_wait_for(WaitFor::seconds(1))
-        .with_env_var("USERS", "test|testpw|/home/test");
-    let container = img.start().unwrap();
-    let port = container.get_host_port_ipv4(21.tcp()).unwrap();
-    let host = "127.0.0.1".to_string();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match Ftp::connect(&host, port, "test", "testpw", true) {
-            Ok(_) => break,
-            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-            Err(error) => panic!("FTP fixture did not become ready: {error:#}"),
-        }
-    }
-    (host, port, container)
-}
-
-fn write_config(local_root: &std::path::Path, host: &str, port: u16) -> std::path::PathBuf {
-    let cfg_path = local_root.join(".ferry/config.toml");
-    let cfg = format!(
-        r#"
-[connection]
-host = "{host}"
-port = {port}
-user = "test"
-password = "testpw"
-passive = true
-
-[paths]
-local_root = "{root}"
-remote_root = "/home/test"
-"#,
-        host = host,
-        port = port,
-        root = local_root.display(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
-    cfg_path
+fn write_config(local_root: &std::path::Path, fixture: &FtpFixture) -> std::path::PathBuf {
+    let config = support::write_config(local_root, fixture);
+    let hidden_config = local_root.join(".ferry/config.toml");
+    std::fs::rename(config, &hidden_config).unwrap();
+    hidden_config
 }
 
 #[test]
 #[ignore]
 fn sync_noop_when_in_sync() {
-    let (host, port, _c) = start_ftp();
+    let fixture = start_ftp();
 
-    let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
     let bytes: &[u8] = b"in sync on both sides\n";
-    ftp.upload_bytes("/home/test/agree.txt", bytes).unwrap();
+    ftp.upload_bytes(&remote_path("agree.txt"), bytes).unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
     let local_root = workdir.path();
@@ -85,7 +46,7 @@ fn sync_noop_when_in_sync() {
     state.save(&state_dir.join("state.json")).unwrap();
     let state_before = std::fs::read(state_dir.join("state.json")).unwrap();
 
-    let cfg_path = write_config(local_root, &host, port);
+    let cfg_path = write_config(local_root, &fixture);
 
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
@@ -105,7 +66,7 @@ fn sync_noop_when_in_sync() {
     assert_eq!(local_after, bytes, "local should be untouched on noop sync");
 
     // Remote file unchanged.
-    let remote_after = ftp.download("/home/test/agree.txt").unwrap();
+    let remote_after = ftp.download(&remote_path("agree.txt")).unwrap();
     assert_eq!(
         remote_after, bytes,
         "remote should be untouched on noop sync"
@@ -124,9 +85,10 @@ fn sync_noop_when_in_sync() {
 #[test]
 #[ignore]
 fn sync_uploads_local_and_downloads_remote_in_one_pass() {
-    let (host, port, _c) = start_ftp();
+    let fixture = start_ftp();
 
-    let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
 
     // Two files. For `local-changed.txt`: local diverged, remote == known.
     //                  For `remote-changed.txt`: remote diverged, local == known.
@@ -136,9 +98,9 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
     let remote_changed_new: &[u8] = b"remote-edited content\n";
 
     // Seed remote: local-changed.txt still matches known; remote-changed.txt has new content.
-    ftp.upload_bytes("/home/test/local-changed.txt", local_changed_known)
+    ftp.upload_bytes(&remote_path("local-changed.txt"), local_changed_known)
         .unwrap();
-    ftp.upload_bytes("/home/test/remote-changed.txt", remote_changed_new)
+    ftp.upload_bytes(&remote_path("remote-changed.txt"), remote_changed_new)
         .unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
@@ -174,7 +136,7 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
     );
     state.save(&state_dir.join("state.json")).unwrap();
 
-    let cfg_path = write_config(local_root, &host, port);
+    let cfg_path = write_config(local_root, &fixture);
 
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
@@ -190,7 +152,7 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
     );
 
     // Remote should now match the locally-edited local-changed.txt.
-    let remote_lc = ftp.download("/home/test/local-changed.txt").unwrap();
+    let remote_lc = ftp.download(&remote_path("local-changed.txt")).unwrap();
     assert_eq!(
         remote_lc, local_changed_new,
         "local-changed.txt remote should be overwritten with local content",
@@ -223,16 +185,17 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
 #[test]
 #[ignore]
 fn sync_refuses_both_changed_then_obeys_force() {
-    let (host, port, _c) = start_ftp();
+    let fixture = start_ftp();
 
-    let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
 
     // Both sides diverged from the known hash.
     let known_bytes: &[u8] = b"originally synced content\n";
     let local_bytes: &[u8] = b"local edited content\n";
     let remote_bytes: &[u8] = b"remote edited content\n";
 
-    ftp.upload_bytes("/home/test/conflict.txt", remote_bytes)
+    ftp.upload_bytes(&remote_path("conflict.txt"), remote_bytes)
         .unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
@@ -256,7 +219,7 @@ fn sync_refuses_both_changed_then_obeys_force() {
     );
     state.save(&state_dir.join("state.json")).unwrap();
 
-    let cfg_path = write_config(local_root, &host, port);
+    let cfg_path = write_config(local_root, &fixture);
 
     // Without --force: sync should fail; neither side should be modified.
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
@@ -276,7 +239,7 @@ fn sync_refuses_both_changed_then_obeys_force() {
         local_after, local_bytes,
         "local edits should be preserved when sync refuses",
     );
-    let remote_after = ftp.download("/home/test/conflict.txt").unwrap();
+    let remote_after = ftp.download(&remote_path("conflict.txt")).unwrap();
     assert_eq!(
         remote_after, remote_bytes,
         "remote edits should be preserved when sync refuses",
@@ -296,7 +259,7 @@ fn sync_refuses_both_changed_then_obeys_force() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    let remote_after_force = ftp.download("/home/test/conflict.txt").unwrap();
+    let remote_after_force = ftp.download(&remote_path("conflict.txt")).unwrap();
     assert_eq!(
         remote_after_force, local_bytes,
         "--force should overwrite remote with local content",

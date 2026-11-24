@@ -110,8 +110,10 @@ fn init_dry_run_does_not_write_config_or_gitignore() {
     );
 }
 
+#[allow(dead_code)]
+mod support;
+
 /// Exercises the full validating init flow against a real FTP server.
-/// Mirrors the container setup pattern in `tests/ftp_integration.rs`.
 ///
 /// Layout under test:
 /// - remote: `shared.txt` ("X"), `remote_only.txt` ("R"), `differs.txt` ("remote-version")
@@ -123,28 +125,20 @@ fn init_dry_run_does_not_write_config_or_gitignore() {
 #[ignore]
 fn validates_existing_local_against_remote() {
     use ferry::ftp::Ftp;
-    use testcontainers::{
-        GenericImage, ImageExt,
-        core::{IntoContainerPort, WaitFor},
-        runners::SyncRunner,
-    };
+    use support::{REMOTE_ROOT, remote_path, start_ftp};
 
-    // Spin up the FTP server. Same image + creds as tests/ftp_integration.rs
-    // so we share the pattern reviewers already know.
-    let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
-        .with_exposed_port(21.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("vsftpd"))
-        .with_env_var("USERS", "test|testpw|/home/test");
-    let container = img.start().unwrap();
-    let port = container.get_host_port_ipv4(21.tcp()).unwrap();
-    let host = "127.0.0.1";
+    let fixture = start_ftp();
+    let host = &fixture.host;
+    let port = fixture.control_port;
 
     // Pre-upload the remote fixtures.
     {
         let mut ftp = Ftp::connect(host, port, "test", "testpw", true).unwrap();
-        ftp.upload_bytes("/shared.txt", b"X").unwrap();
-        ftp.upload_bytes("/remote_only.txt", b"R").unwrap();
-        ftp.upload_bytes("/differs.txt", b"remote-version").unwrap();
+        ftp.upload_bytes(&remote_path("shared.txt"), b"X").unwrap();
+        ftp.upload_bytes(&remote_path("remote_only.txt"), b"R")
+            .unwrap();
+        ftp.upload_bytes(&remote_path("differs.txt"), b"remote-version")
+            .unwrap();
     }
 
     // Local mirror.
@@ -169,7 +163,7 @@ fn validates_existing_local_against_remote() {
     // local_root (default "."), then a 'k' for the single differing file.
     // The local_root we pass is "." so the binary walks the cwd (= local_root).
     let answers = format!(
-        "{host}\n{port}\ntest\ntestpw\n/\n.\nk\n",
+        "{host}\n{port}\ntest\ntestpw\n{REMOTE_ROOT}\n.\nk\n",
         host = host,
         port = port,
     );
@@ -224,9 +218,12 @@ fn validates_existing_local_against_remote() {
 
     // Remote files unchanged.
     let mut ftp = Ftp::connect(host, port, "test", "testpw", true).unwrap();
-    assert_eq!(ftp.download("/shared.txt").unwrap(), b"X");
-    assert_eq!(ftp.download("/remote_only.txt").unwrap(), b"R");
-    assert_eq!(ftp.download("/differs.txt").unwrap(), b"remote-version");
+    assert_eq!(ftp.download(&remote_path("shared.txt")).unwrap(), b"X");
+    assert_eq!(ftp.download(&remote_path("remote_only.txt")).unwrap(), b"R");
+    assert_eq!(
+        ftp.download(&remote_path("differs.txt")).unwrap(),
+        b"remote-version"
+    );
 }
 
 #[test]

@@ -1399,12 +1399,12 @@ fn handle_response<P: Send + 'static>(
     if let Some(slot) = coordinator.force_slots.get_mut(&absolute_path) {
         slot.request_id = None;
     }
-    let affirmative = response.error.is_none()
-        && response
-            .result
-            .and_then(|value| serde_json::from_value::<Option<MessageActionItem>>(value).ok())
-            .flatten()
-            .is_some_and(|action| action.title == "Overwrite local file");
+    let affirmative = response
+        .response_result
+        .ok()
+        .and_then(|value| serde_json::from_value::<Option<MessageActionItem>>(value).ok())
+        .flatten()
+        .is_some_and(|action| action.title == "Overwrite local file");
     if !affirmative {
         coordinator.remove_current_force_slot(&absolute_path, operation_id);
         return false;
@@ -2547,7 +2547,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("shutdown response");
         loop_thread.join().unwrap().unwrap();
-        assert!(response_with_id(shutdown, 62).error.is_none());
+        assert!(response_with_id(shutdown, 62).response_result.is_ok());
         response_with_id(response, 61)
     }
 
@@ -2558,9 +2558,9 @@ mod tests {
 
         let response = request_code_actions(uri.clone());
 
-        assert!(response.error.is_none());
+        assert!(response.response_result.is_ok());
         assert_eq!(
-            response.result.unwrap(),
+            response.response_result.unwrap(),
             serde_json::json!([
                 {
                     "title": "Ferry: Pull",
@@ -2607,8 +2607,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap_or_else(|_| panic!("request {id} acknowledgement"));
         let response = response_with_id(message, id);
-        assert!(response.error.is_none());
-        assert_eq!(response.result, Some(serde_json::Value::Null));
+        assert!(response.response_result.is_ok());
+        assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
     }
 
     fn receive_server_request(client: &Connection, context: &str) -> Request {
@@ -2630,11 +2630,10 @@ mod tests {
     fn respond_to_force_prompt(client: &Connection, prompt: &Request, result: serde_json::Value) {
         client
             .sender
-            .send(Message::Response(Response {
-                id: prompt.id.clone(),
-                result: Some(result),
-                error: None,
-            }))
+            .send(Message::Response(Response::new_ok(
+                prompt.id.clone(),
+                result,
+            )))
             .unwrap();
     }
 
@@ -2795,7 +2794,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("old-response protocol barrier");
-        assert!(response_with_id(barrier, 66).error.is_none());
+        assert!(response_with_id(barrier, 66).response_result.is_ok());
         assert_eq!(
             calls.lock().unwrap().len(),
             2,
@@ -2854,8 +2853,8 @@ mod tests {
                     .expect("unknown response-id barrier"),
                 75,
             )
-            .error
-            .is_none()
+            .response_result
+            .is_ok()
         );
         respond_to_force_prompt(&client, &prompt, serde_json::json!({ "title": "Cancel" }));
         finish_loop(&client, loop_thread, 76);
@@ -2958,8 +2957,8 @@ mod tests {
             .unwrap();
         assert!(
             response_with_id(client.receiver.recv().unwrap(), 82)
-                .error
-                .is_none()
+                .response_result
+                .is_ok()
         );
         respond_to_force_prompt(
             &client,
@@ -3079,8 +3078,8 @@ mod tests {
                 .unwrap();
             assert!(
                 response_with_id(client.receiver.recv().unwrap(), base_id + 1)
-                    .error
-                    .is_none(),
+                    .response_result
+                    .is_ok(),
                 "{label} protocol barrier"
             );
 
@@ -3131,15 +3130,11 @@ mod tests {
         let prompt = send_force_pull(&client, 85, &fixture.uri());
         client
             .sender
-            .send(Message::Response(Response {
-                id: prompt.id,
-                result: None,
-                error: Some(lsp_server::ResponseError {
-                    code: ErrorCode::InternalError as i32,
-                    message: "client rejected request".to_string(),
-                    data: None,
-                }),
-            }))
+            .send(Message::Response(Response::new_err(
+                prompt.id,
+                ErrorCode::InternalError as i32,
+                "client rejected request".to_string(),
+            )))
             .unwrap();
         let next = send_force_pull(&client, 86, &fixture.uri());
         assert_exact_force_prompt(&next, "src/nested/hello world.c", 2);
@@ -3253,7 +3248,7 @@ mod tests {
                     serde_json::from_value::<ShowMessageParams>(notification.params).ok()
                 }
                 Message::Response(response) => {
-                    assert_eq!(response.result, Some(serde_json::Value::Null));
+                    assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
                     None
                 }
                 other => panic!("unexpected enqueue-failure message: {other:?}"),
@@ -3439,8 +3434,8 @@ mod tests {
                     .expect("supersession protocol barrier"),
                 84,
             )
-            .error
-            .is_none()
+            .response_result
+            .is_ok()
         );
         assert!(
             trace
@@ -3581,8 +3576,8 @@ mod tests {
                     .expect("code action while apply blocked"),
                 90,
             )
-            .error
-            .is_none()
+            .response_result
+            .is_ok()
         );
         client
             .sender
@@ -3820,8 +3815,8 @@ mod tests {
         send_shutdown_request(&client, 100);
         assert!(
             response_with_id(client.receiver.recv().unwrap(), 100)
-                .error
-                .is_none()
+                .response_result
+                .is_ok()
         );
         shutdown_rx
             .recv_timeout(Duration::from_secs(2))
@@ -3926,8 +3921,8 @@ mod tests {
 
         let response = request_code_actions(uri);
 
-        assert!(response.error.is_none());
-        assert_eq!(response.result.unwrap(), serde_json::json!([]));
+        assert!(response.response_result.is_ok());
+        assert_eq!(response.response_result.unwrap(), serde_json::json!([]));
     }
 
     #[test]
@@ -3940,8 +3935,8 @@ mod tests {
 
         let response = request_code_actions(uri);
 
-        assert!(response.error.is_none());
-        assert_eq!(response.result.unwrap(), serde_json::json!([]));
+        assert!(response.response_result.is_ok());
+        assert_eq!(response.response_result.unwrap(), serde_json::json!([]));
     }
 
     #[test]
@@ -3957,7 +3952,7 @@ mod tests {
         let (response, messages) = process_server_request(&mut server, request);
 
         assert_eq!(
-            response.error.unwrap().code,
+            response.response_result.unwrap_err().code,
             ErrorCode::InvalidParams as i32
         );
         assert!(messages.is_empty());
@@ -4026,7 +4021,10 @@ mod tests {
         for request in requests {
             let (response, messages) = process_server_request(&mut server, request);
             assert_eq!(
-                response.error.expect("InvalidParams response").code,
+                response
+                    .response_result
+                    .expect_err("InvalidParams response")
+                    .code,
                 ErrorCode::InvalidParams as i32
             );
             assert!(messages.is_empty());
@@ -4046,8 +4044,8 @@ mod tests {
                 &mut server,
                 execute_command_request(id, command, vec![uri.clone()]),
             );
-            assert!(response.error.is_none());
-            assert_eq!(response.result, Some(serde_json::Value::Null));
+            assert!(response.response_result.is_ok());
+            assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].typ, MessageType::INFO);
         }
@@ -4084,8 +4082,11 @@ mod tests {
                 execute_command_request(id, command, vec![uri.clone()]),
             );
 
-            assert!(response.error.is_none(), "{command} must be executable");
-            assert_eq!(response.result, Some(serde_json::Value::Null));
+            assert!(
+                response.response_result.is_ok(),
+                "{command} must be executable"
+            );
+            assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
             assert_eq!(messages.len(), 1);
         }
     }
@@ -4126,7 +4127,7 @@ mod tests {
                 .unwrap();
             let messages = receive_request_messages(&client, id, 2);
             assert!(messages.iter().any(
-                |message| matches!(message, Message::Response(response) if response.error.is_none())
+                |message| matches!(message, Message::Response(response) if response.response_result.is_ok())
             ));
         }
 
@@ -4147,7 +4148,7 @@ mod tests {
         for message in messages {
             match message {
                 Message::Response(response) if response.id == RequestId::from(id) => {
-                    assert!(response.error.is_none());
+                    assert!(response.response_result.is_ok());
                     saw_response = true;
                 }
                 Message::Notification(notification)
@@ -4275,7 +4276,7 @@ mod tests {
             .unwrap();
         let messages = receive_request_messages(&client, 192, 2);
         assert!(messages.iter().any(
-            |message| matches!(message, Message::Response(response) if response.error.is_none())
+            |message| matches!(message, Message::Response(response) if response.response_result.is_ok())
         ));
 
         finish_loop(&client, loop_thread, 193);
@@ -4297,7 +4298,7 @@ mod tests {
             execute_command_request(83, PULL_COMMAND, vec![uri]),
         );
 
-        assert!(response.error.is_none());
+        assert!(response.response_result.is_ok());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].typ, MessageType::WARNING);
         assert!(messages[0].message.contains("operation failed"));
@@ -4323,7 +4324,7 @@ mod tests {
             execute_command_request(84, PULL_COMMAND, vec![uri]),
         );
 
-        assert!(response.error.is_none());
+        assert!(response.response_result.is_ok());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].typ, MessageType::WARNING);
         assert!(messages[0].message.contains("operation failed"));
@@ -4342,8 +4343,8 @@ mod tests {
             execute_command_request(82, "ferry.compare", vec![uri]),
         );
 
-        assert!(response.error.is_none());
-        assert_eq!(response.result, Some(serde_json::Value::Null));
+        assert!(response.response_result.is_ok());
+        assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
         assert_eq!(messages.len(), 1);
         assert!(calls.borrow().is_empty());
     }
@@ -4660,7 +4661,7 @@ mod tests {
                 execute_command_request(90, PULL_COMMAND, vec![uri.clone()]),
             );
 
-            assert!(response.error.is_none());
+            assert!(response.response_result.is_ok());
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].typ, MessageType::INFO);
             assert!(messages[0].message.contains("src/nested/hello world.c"));
@@ -4681,7 +4682,7 @@ mod tests {
                 execute_command_request(100, PUSH_COMMAND, vec![uri.clone()]),
             );
 
-            assert!(response.error.is_none());
+            assert!(response.response_result.is_ok());
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].typ, MessageType::WARNING);
             assert!(messages[0].message.contains("src/nested/hello world.c"));
@@ -4714,7 +4715,7 @@ mod tests {
                 execute_command_request(110, COMPILE_COMMAND, vec![uri.clone()]),
             );
 
-            assert!(response.error.is_none());
+            assert!(response.response_result.is_ok());
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].typ, expected_type);
             assert!(messages[0].message.contains("src/nested/hello world.c"));
@@ -4745,7 +4746,7 @@ mod tests {
                 execute_command_request(120, COMPILE_COMMAND, vec![uri.clone()]),
             );
 
-            assert!(response.error.is_none());
+            assert!(response.response_result.is_ok());
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].typ, MessageType::WARNING);
             assert!(messages[0].message.contains("src/nested/hello world.c"));
@@ -5045,8 +5046,11 @@ mod tests {
                     .expect("responsive Code Action response"),
                 action_id,
             );
-            assert!(response.error.is_none(), "{command}");
-            assert_eq!(response.result.unwrap().as_array().unwrap().len(), 7);
+            assert!(response.response_result.is_ok(), "{command}");
+            assert_eq!(
+                response.response_result.unwrap().as_array().unwrap().len(),
+                7
+            );
 
             release.send(()).unwrap();
             let feedback = receive_show_message(&client, "scoped-sync completion");
@@ -5174,7 +5178,7 @@ mod tests {
                     .expect("lifecycle barrier response"),
                 barrier_id,
             );
-            assert!(barrier.error.is_none(), "{lifecycle:?}");
+            assert!(barrier.response_result.is_ok(), "{lifecycle:?}");
 
             release.send(()).unwrap();
             let feedback = receive_show_message(&client, "scope cancellation feedback");
@@ -5308,7 +5312,7 @@ mod tests {
                 .expect("queued save protocol barrier"),
             213,
         );
-        assert!(barrier.error.is_none());
+        assert!(barrier.response_result.is_ok());
         assert!(
             pushed_rx.try_recv().is_err(),
             "save stays behind folder sync"
@@ -5452,7 +5456,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("prompt shutdown response while sync is staged");
-        assert!(response_with_id(shutdown, 216).error.is_none());
+        assert!(response_with_id(shutdown, 216).response_result.is_ok());
         assert!(shutdown_started.elapsed() < Duration::from_secs(1));
         assert_eq!(fs::read(&fixture.file_path).unwrap(), original);
         assert!(!state_path.exists());
@@ -5716,8 +5720,8 @@ mod tests {
             match message {
                 Message::Response(response) if response.id == RequestId::from(id) => {
                     responses += 1;
-                    assert!(response.error.is_none());
-                    assert_eq!(response.result, Some(serde_json::Value::Null));
+                    assert!(response.response_result.is_ok());
+                    assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
                 }
                 Message::Notification(notification)
                     if notification.method == "window/showMessage" =>
@@ -5745,7 +5749,7 @@ mod tests {
             match message {
                 Message::Response(response) if response.id == RequestId::from(id) => {
                     responses += 1;
-                    assert!(response.error.is_none());
+                    assert!(response.response_result.is_ok());
                 }
                 Message::Notification(notification)
                     if notification.method == "window/showMessage" =>
@@ -5794,7 +5798,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("shutdown response");
-        assert!(response_with_id(shutdown, id).error.is_none());
+        assert!(response_with_id(shutdown, id).response_result.is_ok());
         loop_thread.join().unwrap().unwrap();
     }
 
@@ -6149,7 +6153,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown response");
-        assert!(response_with_id(shutdown, 249).error.is_none());
+        assert!(response_with_id(shutdown, 249).response_result.is_ok());
         client_connection
             .sender
             .send(Message::Request(Request::new(
@@ -6209,7 +6213,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("cleanup error must not delay shutdown response");
 
-        assert!(response_with_id(shutdown, 254).error.is_none());
+        assert!(response_with_id(shutdown, 254).response_result.is_ok());
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
 
         send_exit(&client_connection);
@@ -6240,8 +6244,11 @@ mod tests {
             .unwrap();
         let action_messages = receive_request_messages(&client_connection, 130, 1);
         let actions = response_with_id(action_messages.into_iter().next().unwrap(), 130);
-        assert!(actions.error.is_none());
-        assert_eq!(actions.result.unwrap().as_array().unwrap().len(), 7);
+        assert!(actions.response_result.is_ok());
+        assert_eq!(
+            actions.response_result.unwrap().as_array().unwrap().len(),
+            7
+        );
 
         let mut feedback = Vec::new();
         for (id, command) in [
@@ -6262,8 +6269,8 @@ mod tests {
                 match message {
                     Message::Response(response) => {
                         assert_eq!(response.id, RequestId::from(id));
-                        assert!(response.error.is_none());
-                        assert_eq!(response.result, Some(serde_json::Value::Null));
+                        assert!(response.response_result.is_ok());
+                        assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
                     }
                     Message::Notification(notification)
                         if notification.method == "window/showMessage" =>
@@ -6285,7 +6292,7 @@ mod tests {
             .expect("shutdown response");
         loop_thread.join().unwrap().unwrap();
 
-        assert!(response_with_id(shutdown, 134).error.is_none());
+        assert!(response_with_id(shutdown, 134).response_result.is_ok());
         assert_eq!(feedback.len(), 3);
         assert!(feedback.iter().all(|message| {
             message.typ == MessageType::INFO && message.message.contains("src/nested/hello world.c")
@@ -6341,10 +6348,13 @@ mod tests {
 
         let unsupported = response_with_id(unsupported.expect("unsupported request response"), 41);
         assert_eq!(
-            unsupported.error.expect("JSON-RPC error").code,
+            unsupported
+                .response_result
+                .expect_err("JSON-RPC error")
+                .code,
             ErrorCode::MethodNotFound as i32
         );
-        assert!(response_with_id(shutdown, 42).error.is_none());
+        assert!(response_with_id(shutdown, 42).response_result.is_ok());
     }
 
     struct BlockingOperations {
@@ -6599,8 +6609,8 @@ mod tests {
         let response = receive_request_messages(&client_connection, 271, 1);
         assert!(
             response_with_id(response.into_iter().next().unwrap(), 271)
-                .error
-                .is_none()
+                .response_result
+                .is_ok()
         );
         started_rx
             .recv_timeout(Duration::from_secs(1))
@@ -6618,7 +6628,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("protocol barrier response");
-        assert!(response_with_id(barrier, 272).error.is_none());
+        assert!(response_with_id(barrier, 272).response_result.is_ok());
         release_barrier(&release);
         finished_rx
             .recv_timeout(Duration::from_secs(1))
@@ -6824,7 +6834,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("prompt shutdown response");
-        assert!(response_with_id(shutdown, 276).error.is_none());
+        assert!(response_with_id(shutdown, 276).response_result.is_ok());
         release_barrier(&release);
         finished_rx
             .recv_timeout(Duration::from_secs(1))
@@ -7052,8 +7062,11 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("command response must not wait for retrieval");
         let acknowledgement = response_with_id(acknowledgement, 301);
-        assert!(acknowledgement.error.is_none());
-        assert_eq!(acknowledgement.result, Some(serde_json::Value::Null));
+        assert!(acknowledgement.response_result.is_ok());
+        assert_eq!(
+            acknowledgement.response_result.unwrap(),
+            serde_json::Value::Null
+        );
 
         client_connection
             .sender
@@ -7069,7 +7082,12 @@ mod tests {
             .expect("code action proves didChange was processed while retrieval blocked");
         let responsive_action = response_with_id(responsive_action, 302);
         assert_eq!(
-            responsive_action.result.unwrap().as_array().unwrap().len(),
+            responsive_action
+                .response_result
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
             7
         );
 
@@ -7155,14 +7173,18 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_millis(500))
             .expect("prompt Compare acknowledgement");
-        assert!(response_with_id(acknowledgement, 311).error.is_none());
+        assert!(
+            response_with_id(acknowledgement, 311)
+                .response_result
+                .is_ok()
+        );
 
         send_shutdown_request(&client_connection, 312);
         let shutdown = client_connection
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown response while exit is withheld");
-        assert!(response_with_id(shutdown, 312).error.is_none());
+        assert!(response_with_id(shutdown, 312).response_result.is_ok());
         assert!(!guard.try_claim(), "shutdown must cancel the pending guard");
         assert!(snapshot_shutdown.is_closed().unwrap());
         assert!(
@@ -7241,8 +7263,8 @@ mod tests {
         for message in messages {
             match message {
                 Message::Response(response) => {
-                    assert!(response.error.is_none());
-                    assert_eq!(response.result, Some(serde_json::Value::Null));
+                    assert!(response.response_result.is_ok());
+                    assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
                 }
                 Message::Notification(notification)
                     if notification.method == "window/showMessage" =>
@@ -7279,7 +7301,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown response while exit withheld");
-        assert!(response_with_id(shutdown, 322).error.is_none());
+        assert!(response_with_id(shutdown, 322).response_result.is_ok());
         assert!(!launched[0].1.exists());
         assert!(!root.exists());
         send_exit(&client_connection);
@@ -7417,8 +7439,8 @@ mod tests {
                 .into_iter()
                 .filter_map(|message| match message {
                     Message::Response(response) => {
-                        assert!(response.error.is_none());
-                        assert_eq!(response.result, Some(serde_json::Value::Null));
+                        assert!(response.response_result.is_ok());
+                        assert_eq!(response.response_result.unwrap(), serde_json::Value::Null);
                         None
                     }
                     Message::Notification(notification)
@@ -7575,7 +7597,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("shutdown response must arrive before exit");
 
-        assert!(response_with_id(shutdown, 253).error.is_none());
+        assert!(response_with_id(shutdown, 253).response_result.is_ok());
         snapshot_closed_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("snapshot boundary must close during shutdown handshake");
@@ -7727,7 +7749,7 @@ mod tests {
             prompt_shutdown.expect("shutdown response must not wait for file operation"),
             51,
         );
-        assert!(shutdown.error.is_none());
+        assert!(shutdown.response_result.is_ok());
         assert!(prompt_loop_exit, "main loop should terminate promptly");
         assert!(writer_disconnected, "worker must not retain the LSP sender");
     }
@@ -7779,9 +7801,13 @@ mod tests {
             prompt_action.expect("code action must not wait for transfer worker"),
             141,
         );
-        assert!(action.error.is_none());
-        assert_eq!(action.result.unwrap().as_array().unwrap().len(), 7);
-        assert!(response_with_id(prompt_shutdown, 142).error.is_none());
+        assert!(action.response_result.is_ok());
+        assert_eq!(action.response_result.unwrap().as_array().unwrap().len(), 7);
+        assert!(
+            response_with_id(prompt_shutdown, 142)
+                .response_result
+                .is_ok()
+        );
     }
 
     #[test]
@@ -7847,9 +7873,13 @@ mod tests {
             prompt_command.expect("command response must precede blocked operation"),
             151,
         );
-        assert!(command.error.is_none());
-        assert_eq!(command.result, Some(serde_json::Value::Null));
-        assert!(response_with_id(prompt_shutdown, 152).error.is_none());
+        assert!(command.response_result.is_ok());
+        assert_eq!(command.response_result.unwrap(), serde_json::Value::Null);
+        assert!(
+            response_with_id(prompt_shutdown, 152)
+                .response_result
+                .is_ok()
+        );
         assert!(prompt_loop_exit, "main loop should terminate promptly");
         assert!(writer_disconnected, "worker must not retain the LSP sender");
     }
@@ -7916,8 +7946,8 @@ mod tests {
         loop_thread.join().unwrap().unwrap();
 
         let command = response_with_id(prompt_command.expect("prompt command response"), 161);
-        assert!(command.error.is_none());
-        assert_eq!(command.result, Some(serde_json::Value::Null));
+        assert!(command.response_result.is_ok());
+        assert_eq!(command.response_result.unwrap(), serde_json::Value::Null);
         let warning = match eventual_feedback.expect("safe stale-command warning") {
             Message::Notification(notification) if notification.method == "window/showMessage" => {
                 serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
@@ -7942,7 +7972,7 @@ mod tests {
             "stale target must not run",
         );
         assert!(no_duplicate, "command must receive exactly one response");
-        assert!(response_with_id(shutdown, 162).error.is_none());
+        assert!(response_with_id(shutdown, 162).response_result.is_ok());
     }
 
     #[test]
@@ -7992,7 +8022,7 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("queued-open protocol barrier");
-        assert!(response_with_id(queued, 163).error.is_none());
+        assert!(response_with_id(queued, 163).response_result.is_ok());
 
         let other_root = fixture.config_path.parent().unwrap().join("other");
         fs::create_dir(&other_root).unwrap();
@@ -8015,7 +8045,11 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("compile acknowledgement");
-        assert!(response_with_id(compile_response, 164).error.is_none());
+        assert!(
+            response_with_id(compile_response, 164)
+                .response_result
+                .is_ok()
+        );
         release_barrier(&release);
         finished_rx
             .recv_timeout(Duration::from_secs(1))

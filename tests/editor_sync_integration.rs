@@ -263,7 +263,13 @@ fn run_output_child(test: &str, mode: &str) -> std::process::Output {
 }
 
 fn assert_silent_api_bytes(output: std::process::Output) {
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "output probe exited with {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     assert_eq!(
         api_bytes_between(&output.stdout, STDOUT_BEGIN, STDOUT_END),
         Vec::<u8>::new(),
@@ -352,16 +358,13 @@ fn single_file_successful_transfers_are_silent() {
 
 #[test]
 #[ignore]
-fn single_file_noop_and_missing_source_outcomes_do_not_write_state() {
+fn single_file_unchanged_and_missing_source_outcomes() {
     let fixture = start_ftp();
     let local = tempfile::tempdir().unwrap();
     let config = write_config(local.path(), &fixture);
     let rel = "unchanged.txt";
     let bytes = b"unchanged\n";
-    std::fs::write(local.path().join(rel), bytes).unwrap();
-    seed_state(local.path(), rel, bytes);
     let state_path = local.path().join(".ferry/state.json");
-    let state_before = std::fs::read(&state_path).unwrap();
     let mut ftp =
         Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
     ftp.upload_bytes(&remote_path(rel), bytes).unwrap();
@@ -369,6 +372,12 @@ fn single_file_noop_and_missing_source_outcomes_do_not_write_state() {
         .unwrap();
     std::fs::write(local.path().join("local-only.txt"), b"local\n").unwrap();
 
+    assert_eq!(
+        pull_one(&config, rel, false, ExecutionMode::Apply)
+            .unwrap()
+            .status,
+        TransferStatus::Transferred
+    );
     assert_eq!(
         pull_one(&config, rel, false, ExecutionMode::Apply)
             .unwrap()
@@ -381,6 +390,9 @@ fn single_file_noop_and_missing_source_outcomes_do_not_write_state() {
             .status,
         TransferStatus::Unchanged
     );
+    // An unchanged pull can refresh the synchronization timestamp and MDTM
+    // capability. Missing sources should leave that updated state alone.
+    let state_before_missing = std::fs::read(&state_path).unwrap();
     assert_eq!(
         pull_one(&config, "local-only.txt", false, ExecutionMode::Apply)
             .unwrap()
@@ -393,7 +405,7 @@ fn single_file_noop_and_missing_source_outcomes_do_not_write_state() {
             .status,
         TransferStatus::SkippedMissingSource
     );
-    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before_missing);
 }
 
 #[test]
