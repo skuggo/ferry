@@ -16,13 +16,11 @@ pub fn hash_file(path: &Path) -> anyhow::Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

@@ -5,6 +5,14 @@ use std::io::Cursor;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 use suppaftp::FtpStream;
+use suppaftp::list::ListParser;
+
+// MDTM is always UTC per RFC 3659 §3.
+fn mdtm_utc(civil: jiff::civil::DateTime) -> Result<DateTime<Utc>> {
+    let timestamp = jiff::tz::Offset::UTC.to_timestamp(civil)?;
+    DateTime::from_timestamp(timestamp.as_second(), timestamp.subsec_nanosecond() as u32)
+        .context("FTP modification time outside the supported range")
+}
 
 /// How long a connect, read or write may stall before it fails. Without it a
 /// data connection the server drops can leave ferry waiting forever (the
@@ -398,7 +406,7 @@ impl Ftp {
         let entries = parse_listing_tolerant(&lines);
         self.remember_listing(parent, &entries);
         let target = lines.into_iter().find_map(|line| {
-            let file = match suppaftp::list::File::from_posix_line(&line) {
+            let file = match ListParser::parse_posix(&line) {
                 Ok(file) => file,
                 Err(_) => return None,
             };
@@ -648,7 +656,7 @@ fn parse_listing_tolerant(lines: &[String]) -> Vec<Entry> {
     lines
         .iter()
         .filter_map(|line| {
-            let file = suppaftp::list::File::from_posix_line(line).ok()?;
+            let file = ListParser::parse_posix(line).ok()?;
             Some(entry_from_posix_file(&file))
         })
         .collect()
@@ -660,7 +668,7 @@ fn parse_listing_strict(dir: &str, lines: &[String]) -> Result<Vec<Entry>> {
         if line.trim().is_empty() {
             continue;
         }
-        let file = suppaftp::list::File::from_posix_line(line).map_err(|_| {
+        let file = ListParser::parse_posix(line).map_err(|_| {
             anyhow::anyhow!(
                 "ftp list {}: invalid record {index}",
                 sanitize_for_message(dir)
@@ -674,7 +682,7 @@ fn parse_listing_strict(dir: &str, lines: &[String]) -> Result<Vec<Entry>> {
         //
         // Forward-compatibility guard: `suppaftp::list::FileType` has exactly
         // three variants today (directory, file, symlink), so this bail is
-        // unreachable with suppaftp 6.x. It stays because `entry_from_posix_file`
+        // unreachable with the current suppaftp. It stays because `entry_from_posix_file`
         // derives `is_dir` from `is_directory()`, which would silently present
         // any future variant (socket, device, ...) as a regular file. Refusing
         // an unknown record type is the fail-closed choice.
@@ -775,11 +783,11 @@ impl Ftp {
     }
 
     pub(crate) fn mtime_scoped(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
-        let naive = self
+        let civil = self
             .inner
             .mdtm(remote_path)
             .map_err(|error| scoped_mtime_transport_error(remote_path, error))?;
-        Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+        mdtm_utc(civil)
     }
 
     pub(crate) fn size_scoped(&mut self, remote_path: &str) -> Result<u64> {
@@ -812,13 +820,12 @@ impl Ftp {
         Ok(n as u64)
     }
 
-    // MDTM is always UTC per RFC 3659 §3.
     pub fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
-        let naive = self
+        let civil = self
             .inner
             .mdtm(remote_path)
             .with_context(|| format!("ftp mtime {remote_path}"))?;
-        Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+        mdtm_utc(civil)
     }
 
     pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
@@ -874,7 +881,7 @@ impl Ftp {
                 };
                 if let Ok(lines) = self.inner.list(Some(parent)) {
                     let exists = lines.iter().any(|line| {
-                        suppaftp::list::File::from_posix_line(line)
+                        ListParser::parse_posix(line)
                             .map(|f| f.is_directory() && f.name() == leaf)
                             .unwrap_or(false)
                     });
